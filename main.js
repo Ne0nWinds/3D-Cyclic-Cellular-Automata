@@ -4,7 +4,7 @@ import {
 } from './wgpu-matrix.module.min.js';
 
 const adapter = await navigator.gpu.requestAdapter();
-const device = await adapter.requestDevice();
+const device = await adapter.requestDevice({ requiredFeatures: ['timestamp-query'] });
 
 const canvas = document.getElementById("canvas");
 const context = canvas.getContext("webgpu");
@@ -75,14 +75,6 @@ const cubeSizeSq = ${cubeSizeSq};
 @vertex
 fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f) -> VSOut {
 
-	if (readBuffer[instance_id] <= 3) {
-		// early reject: push outside clip space
-		var out: VSOut;
-		out.position = vec4f(-2.0, -2.0, -2.0, 1.0);
-		out.color = vec3f(0.0);
-		return out;
-	}
-
 	const cubeScale = 0.5;
 	const center_offset = (cubeSize / 2.0 - 0.5) * cubeScale;
 	var translation = vec3f(
@@ -118,7 +110,7 @@ const states = ${states};
 const threshold = ${threshold};
 
 @compute
-@workgroup_size(32, 2, 2)
+@workgroup_size(64, 1, 1)
 fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 	let idx = id.z * cubeSizeSq + id.y * cubeSize + id.x;
 	let current_state = readBuffer[idx];
@@ -127,9 +119,9 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 	const range = 1;
 
 	var count = 0u;
-	for (var z = -range; z <= range; z += range) {
-		for (var y = -range; y <= range; y += range) {
-			for (var x = -range; x <= range; x += range) {
+	for (var z = -range; z <= range; z += 1) {
+		for (var y = -range; y <= range; y += 1) {
+			for (var x = -range; x <= range; x += 1) {
 				if (z == 0 && y == 0 && x == 0) { continue; }
 
 				let nz = wrapCoord(z + i32(id.z));
@@ -361,6 +353,16 @@ const computeBindGroups = [
 	})
 ];
 
+const querySet = device.createQuerySet({ type: 'timestamp', count: 4 });
+const queryBuffer = device.createBuffer({
+	size: 256,
+	usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
+});
+const queryBufferCPU = device.createBuffer({
+	size: 256,
+	usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+});
+
 let depthTexture;
 let depthView;
 
@@ -369,7 +371,23 @@ const start = document.timeline.currentTime;
 const frameSkip = 3;
 let frameIndex = -1;
 
-function frame(currentTime) {
+let writingBenchmarkResults = false;
+async function writeResults(frameIndex) {
+	writingBenchmarkResults = true;
+	await queryBufferCPU.mapAsync(GPUMapMode.READ);
+	const view = new BigInt64Array(queryBufferCPU.getMappedRange());
+	const renderPassDuration = view[1] - view[0];
+	const computePassDuration = view[3] - view[2];
+	queryBufferCPU.unmap();
+	writingBenchmarkResults = false;
+
+	const granularity = 1000;
+	const renderPassDurationMS = Number(renderPassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
+	const computePassDurationMS = Number(computePassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
+	console.log(`Frame ${frameIndex} - Render Pass: ${renderPassDurationMS}ms - Compute Pass: ${computePassDurationMS}ms`);
+}
+
+async function frame(currentTime) {
 
 	frameIndex += 1;
 
@@ -409,6 +427,11 @@ function frame(currentTime) {
 				depthClearValue: 1.0,
 				depthLoadOp: "clear",
 				depthStoreOp: "store"
+			},
+			timestampWrites: {
+				querySet,
+				beginningOfPassWriteIndex: 0,
+				endOfPassWriteIndex: 1,
 			}
 		});
 		pass.setPipeline(renderPipeline);
@@ -418,18 +441,32 @@ function frame(currentTime) {
 		pass.draw(36, cubeSize * cubeSize * cubeSize);
 		pass.end();
 	}
-	if (frameIndex % frameSkip == 0) {
-		const pass = encoder.beginComputePass();
+	if (1) {
+		const pass = encoder.beginComputePass({
+			timestampWrites: {
+				querySet,
+				beginningOfPassWriteIndex: 2,
+				endOfPassWriteIndex: 3,
+			}
+		});
 		pass.setPipeline(computePipeline);
 		pass.setBindGroup(0, renderUniformBindGroup);
 		pass.setBindGroup(1, computeBindGroups[bindGroupIndex]);
-		pass.dispatchWorkgroups(cubeSize / 32, cubeSize / 2, cubeSize / 2);
+		pass.dispatchWorkgroups(cubeSize / 64, cubeSize, cubeSize);
 		pass.end();
 		bindGroupIndex ^= 1;
 	}
+	encoder.resolveQuerySet(querySet, 0, 4, queryBuffer, 0);
+	if (!writingBenchmarkResults) {
+		encoder.copyBufferToBuffer(queryBuffer, 0, queryBufferCPU, 0, 256);
+	}
 
 	device.queue.submit([encoder.finish()]);
+	if (!writingBenchmarkResults) {
+		writeResults(frameIndex);
+	}
 	requestAnimationFrame(frame);
+
 }
 requestAnimationFrame(frame);
 
