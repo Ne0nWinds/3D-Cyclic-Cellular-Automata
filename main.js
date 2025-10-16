@@ -26,9 +26,8 @@ const shaderModule = device.createShaderModule({
 `
 struct VSOut {
 	@builtin(position) position: vec4f,
-
-	@interpolate(flat)
-	@location(0) color: vec3f
+	
+	@location(0) cube_pos: vec3f
 };
 
 struct Constants {
@@ -74,30 +73,22 @@ const cubeSizeSq = ${cubeSizeSq};
 
 @vertex
 fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f) -> VSOut {
-
-	const cubeScale = 0.5;
-	const center_offset = (cubeSize / 2.0 - 0.5) * cubeScale;
-	var translation = vec3f(
-		f32(instance_id % cubeSize) * cubeScale - center_offset,
-		f32((instance_id % cubeSizeSq) / cubeSize) * cubeScale - center_offset,
-		f32(instance_id / cubeSizeSq) * cubeScale - center_offset
-	);
-	translation *= 2.0;
-
-	let pos = constants.mvp * vec4f(in_pos * cubeScale + translation, 1.0);
-
-	let current_state = readBuffer[instance_id];
-	let c = hsl(f32(current_state) / f32(states), 0.5, 0.55);
+	let pos = constants.mvp * vec4f(in_pos, 1.0);
 
 	var out: VSOut;
 	out.position = pos;
-	out.color = c;
+	out.cube_pos = (in_pos + 0.5) * (255.0 / 256.0);
 	return out;
 }
 
 @fragment
-fn fs_main(@location(0) @interpolate(flat) color: vec3f) -> @location(0) vec4f {
-	return vec4f(color, 1.0);
+fn fs_main(@location(0) cube_pos : vec3f) -> @location(0) vec4f {
+	let index3D = vec3<i32>(cube_pos * cubeSize);
+	let flatIndex = index3D.z*cubeSizeSq + index3D.y*cubeSize + index3D.x;
+
+	let current_state = readBuffer[flatIndex];
+	let c = vec3f(f32(current_state) / f32(states));
+	return vec4f(0.125, c.xx, 1.0);
 }
 
 fn wrapCoord(n: i32) -> i32 {
@@ -394,7 +385,7 @@ async function frame(currentTime) {
 	const elapsedTime = (currentTime - start) * (1.0 / 1024.0);
 
 	{
-		const eye = vec3.create(Math.sin(elapsedTime * 0.5) * cubeSize * 2.0, cubeSize / 1.5, Math.cos(elapsedTime * 0.5) * cubeSize * 2.0);
+		const eye = vec3.create(Math.sin(elapsedTime * 0.5) * 1.5, 1.0, Math.cos(elapsedTime * 0.5) * 1.5);
 		const target = vec3.create(0, 0, 0);
 		const up = vec3.create(0, 1, 0);
 		const view = mat4.lookAt(eye, target, up);
@@ -438,7 +429,7 @@ async function frame(currentTime) {
 		pass.setVertexBuffer(0, vertexBuffer);
 		pass.setBindGroup(0, renderUniformBindGroup);
 		pass.setBindGroup(1, renderBindGroups[bindGroupIndex]);
-		pass.draw(36, cubeSize * cubeSize * cubeSize);
+		pass.draw(36, 1);
 		pass.end();
 	}
 	if (1) {
