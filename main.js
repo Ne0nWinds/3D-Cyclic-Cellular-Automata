@@ -4,7 +4,12 @@ import {
 } from './wgpu-matrix.module.min.js';
 
 const adapter = await navigator.gpu.requestAdapter();
-const device = await adapter.requestDevice({ requiredFeatures: ['timestamp-query'] });
+const limits = adapter.limits;
+const device = await adapter.requestDevice({ requiredFeatures: ['timestamp-query'], requiredLimits: {
+	maxBufferSize: limits.maxBufferSize,
+	maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
+}
+});
 
 const canvas = document.getElementById("canvas");
 const context = canvas.getContext("webgpu");
@@ -18,8 +23,12 @@ context.configure({
 
 const states = 7;
 const threshold = 4;
-const cubeSize = 64;
+const cubeSize = 256;
 const cubeSizeSq = cubeSize**2;
+
+const workgroupX = 8;
+const workgroupY = 4;
+const workgroupZ = 4;
 
 const shaderModule = device.createShaderModule({
 	code:
@@ -73,11 +82,11 @@ const cubeSizeSq = ${cubeSizeSq};
 
 @vertex
 fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f) -> VSOut {
-	let pos = constants.mvp * vec4f(in_pos, 1.0);
+	var pos = in_pos;
 
 	var out: VSOut;
-	out.position = pos;
-	out.cube_pos = (in_pos + 0.5) * (255.0 / 256.0);
+	out.position = constants.mvp * vec4f(pos, 1.0);
+	out.cube_pos = (pos + 0.5) * (1023.0 / 1024.0);
 	return out;
 }
 
@@ -87,8 +96,9 @@ fn fs_main(@location(0) cube_pos : vec3f) -> @location(0) vec4f {
 	let flatIndex = index3D.z*cubeSizeSq + index3D.y*cubeSize + index3D.x;
 
 	let current_state = readBuffer[flatIndex];
+	// let c = hsl(f32(current_state) / f32(states) * 0.25 + 0.5, 0.75, 0.5);
 	let c = vec3f(f32(current_state) / f32(states));
-	return vec4f(0.125, c.xx, 1.0);
+	return vec4f(c, 1.0);
 }
 
 fn wrapCoord(n: i32) -> i32 {
@@ -100,15 +110,22 @@ fn wrapCoord(n: i32) -> i32 {
 const states = ${states};
 const threshold = ${threshold};
 
-@compute
-@workgroup_size(64, 1, 1)
-fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+const workgroupSize = vec3i(${workgroupX}, ${workgroupY}, ${workgroupZ});
+const sharedMemorySize = vec3i(${workgroupX + 2}, ${workgroupY + 2}, ${workgroupZ + 2});
+const totalSharedMemorySize = sharedMemorySize.x * sharedMemorySize.y * sharedMemorySize.z;
+
+var<workgroup> shared_memory : array<u32, totalSharedMemorySize>;
+
+fn wrapCoords(coords: vec3i) -> vec3i {
+	return vec3i(wrapCoord(coords.x), wrapCoord(coords.y), wrapCoord(coords.z));
+}
+
+const range = 1;
+
+fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	let idx = id.z * cubeSizeSq + id.y * cubeSize + id.x;
 	let current_state = readBuffer[idx];
 	let next_state = select(current_state + 1, 0, current_state + 1 == states);
-
-	const range = 1;
-
 	var count = 0u;
 	for (var z = -range; z <= range; z += 1) {
 		for (var y = -range; y <= range; y += 1) {
@@ -118,15 +135,70 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 				let nz = wrapCoord(z + i32(id.z));
 				let ny = wrapCoord(y + i32(id.y));
 				let nx = wrapCoord(x + i32(id.x));
-				let index = nz*(cubeSizeSq) + ny*cubeSize + nx;
+				let index = (nz*cubeSizeSq) + (ny*cubeSize) + nx;
 				if (readBuffer[index] == next_state) {
 					count += 1u;
 				}
 			}
 		}
 	}
+	writeBuffer[idx] = select(current_state, next_state, count >= threshold);
+}
+fn cca_shared(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
+	let idx = id.z * cubeSizeSq + id.y * cubeSize + id.x;
+
+
+	let base = wrapCoords(vec3i(workgroup_id) * workgroupSize - vec3i(1));
+
+	let flat_local_id = (i32(local_id.z)*workgroupSize.x*workgroupSize.y) + (i32(local_id.y) * workgroupSize.x) + i32(local_id.x);
+	for (var i = 0; i < totalSharedMemorySize; i += (workgroupSize.x*workgroupSize.y*workgroupSize.z)) {
+		let thread_index = i + flat_local_id;
+		let z = (thread_index / (sharedMemorySize.x * sharedMemorySize.y));
+		let xy = (thread_index % (sharedMemorySize.x * sharedMemorySize.y));
+		let y = xy / sharedMemorySize.x;
+		let x = xy % sharedMemorySize.x;
+
+		let global_index = wrapCoords(base + vec3i(x, y, z));
+		if (thread_index < totalSharedMemorySize) {
+			shared_memory[thread_index] = readBuffer[global_index.z * cubeSizeSq + global_index.y * cubeSize + global_index.x];
+		}
+	}
+
+	workgroupBarrier();
+
+	let shared_idx = vec3i(local_id) + vec3i(range);
+	let current_state = shared_memory[(shared_idx.z*sharedMemorySize.x*sharedMemorySize.y) + shared_idx.y*sharedMemorySize.x + shared_idx.x];
+	let next_state = select(current_state + 1, 0, current_state + 1 == states);
+
+	var count = 0u;
+
+	for (var z = -range; z <= range; z += 1) {
+		for (var y = -range; y <= range; y += 1) {
+			for (var x = -range; x <= range; x += 1) {
+				if (z == 0 && y == 0 && x == 0) { continue; }
+
+				let nz = z + shared_idx.z;
+				let ny = y + shared_idx.y;
+				let nx = x + shared_idx.x;
+				let index = (nz * sharedMemorySize.x*sharedMemorySize.y) + (ny * sharedMemorySize.x) + nx;
+				if (shared_memory[index] == next_state) {
+					count += 1;
+				}
+			}
+		}
+	}
 
 	writeBuffer[idx] = select(current_state, next_state, count >= threshold);
+}
+
+@compute
+@workgroup_size(${workgroupX}, ${workgroupY}, ${workgroupZ})
+fn cs_main(
+	@builtin(global_invocation_id) id: vec3<u32>,
+	@builtin(local_invocation_id) local_id: vec3<u32>,
+	@builtin(workgroup_id) workgroup_id : vec3<u32>
+) {
+	cca_shared(id, local_id, workgroup_id);
 }
 
 `
@@ -359,7 +431,7 @@ let depthView;
 
 const start = document.timeline.currentTime;
 
-const frameSkip = 3;
+const frameSkip = 4;
 let frameIndex = -1;
 
 let writingBenchmarkResults = false;
@@ -385,7 +457,7 @@ async function frame(currentTime) {
 	const elapsedTime = (currentTime - start) * (1.0 / 1024.0);
 
 	{
-		const eye = vec3.create(Math.sin(elapsedTime * 0.5) * 1.5, 1.0, Math.cos(elapsedTime * 0.5) * 1.5);
+		const eye = vec3.create(Math.sin(0.5) * 1.5, 1.0, Math.cos(0.5) * 1.5);
 		const target = vec3.create(0, 0, 0);
 		const up = vec3.create(0, 1, 0);
 		const view = mat4.lookAt(eye, target, up);
@@ -432,7 +504,7 @@ async function frame(currentTime) {
 		pass.draw(36, 1);
 		pass.end();
 	}
-	if (1) {
+	if (frameIndex % frameSkip != 0) {
 		const pass = encoder.beginComputePass({
 			timestampWrites: {
 				querySet,
@@ -443,7 +515,7 @@ async function frame(currentTime) {
 		pass.setPipeline(computePipeline);
 		pass.setBindGroup(0, renderUniformBindGroup);
 		pass.setBindGroup(1, computeBindGroups[bindGroupIndex]);
-		pass.dispatchWorkgroups(cubeSize / 64, cubeSize, cubeSize);
+		pass.dispatchWorkgroups(cubeSize / workgroupX, cubeSize / workgroupY, cubeSize / workgroupZ);
 		pass.end();
 		bindGroupIndex ^= 1;
 	}
