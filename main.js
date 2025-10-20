@@ -21,17 +21,34 @@ context.configure({
 	alphaMode: "opaque"
 });
 
-const states = 7;
-const threshold = 4;
+const states = 5;
+const threshold = 8;
 const cubeSize = 256;
 const cubeSizeSq = cubeSize**2;
 
 const workgroupX = 8;
 const workgroupY = 4;
 const workgroupZ = 2;
-const usePackedValues = false;
+const usePackedValues = true;
 
-const packedCubeSize = cubeSize / 4;
+const packedValueSize = 4;
+const packedValueCount = Math.floor(32 / packedValueSize);
+const packedValueMask = ((1 << packedValueSize) - 1) | 0;
+const packedCubeSize = cubeSize / packedValueCount;
+
+function downloadCanvasPNG(namePrefix = "canvas") {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `${namePrefix}_${stamp}.png`;
+
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    const a = document.createElement("a");
+    a.download = filename;
+    a.href = URL.createObjectURL(blob);
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, "image/png");
+}
 
 const shaderModule = device.createShaderModule({
 	code:
@@ -82,6 +99,10 @@ fn hsl(h: f32, s: f32, l: f32) -> vec3f {
 
 const cubeSize = ${cubeSize};
 const cubeSizeSq = ${cubeSizeSq};
+
+const packedValueSize = ${packedValueSize};
+const packedValueCount = ${packedValueCount};
+const packedValueMask = ${packedValueMask};
 const packedCubeSize = ${packedCubeSize};
 
 @vertex
@@ -101,15 +122,15 @@ fn fs_main(@location(0) cube_pos : vec3f) -> @location(0) vec4f {
 	if (usePackedValues) {
 		let index3D = vec3f(cube_pos * vec3f(packedCubeSize, cubeSize, cubeSize));
 		let flatIndex = u32(index3D.z)*(cubeSize * packedCubeSize) + u32(index3D.y)*packedCubeSize + u32(index3D.x);
-		let bitIndex = u32(index3D.x * 4.0);
-		current_state = (readBuffer[flatIndex] >> (bitIndex * 8)) & 0xFF;
+		let bitIndex = u32(index3D.x * f32(packedValueCount));
+		current_state = (readBuffer[flatIndex] >> (bitIndex * packedValueSize)) & packedValueMask;
 	} else {
 		let index3D = vec3<i32>(cube_pos * cubeSize);
 		let flatIndex = index3D.z*cubeSizeSq + index3D.y*cubeSize + index3D.x;
 		current_state = readBuffer[flatIndex];
 	}
-	// let c = hsl(f32(current_state) / f32(states) * 0.25 + 0.5, 0.75, 0.5);
-	let c = vec3f(f32(current_state) / f32(states));
+	let c = hsl(f32(current_state) / f32(states) * 0.5 + 0.5, 0.65, 0.5);
+	// let c = vec3f(f32(current_state) / f32(states));
 	return vec4f(c, 1.0);
 }
 
@@ -120,10 +141,6 @@ const threshold = ${threshold};
 const range = 1;
 
 const workgroupSize = vec3i(${workgroupX}, ${workgroupY}, ${workgroupZ});
-const sharedMemorySize = vec3i(${workgroupX } + range*2, ${workgroupY} + range*2, ${workgroupZ} + range*2);
-const totalSharedMemorySize = sharedMemorySize.x * sharedMemorySize.y * sharedMemorySize.z;
-
-var<workgroup> shared_memory : array<u32, totalSharedMemorySize>;
 
 fn wrapCoord(n: i32) -> i32 {
 	if (n >= cubeSize) { return n - cubeSize; };
@@ -165,59 +182,6 @@ fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 
 fn flatten_index(index: vec3i, dimensions: vec3i) -> i32 {
 	return (index.z*(dimensions.x*dimensions.y)) + index.y*dimensions.x + index.x;
-}
-
-fn cca_shared(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
-	let idx = id.z * cubeSizeSq + id.y * cubeSize + id.x;
-
-	let shared_idx = vec3i(local_id) + vec3i(range);
-	let shared_flat_index = flatten_index(shared_idx, sharedMemorySize);
-	let current_state = readBuffer[idx];
-	shared_memory[shared_flat_index] = current_state;
-
-	workgroupBarrier();
-
-	/*
-	let base = vec3i(workgroup_id) * workgroupSize - vec3i(range);
-
-	for (var z = i32(local_id.z); z < sharedMemorySize.z; z += workgroupSize.z) {
-		let gz = wrapCoord(base.z + z) * cubeSizeSq;
-		for (var y = i32(local_id.y); y < sharedMemorySize.y; y += workgroupSize.y) {
-			let gy = wrapCoord(base.y + y) * cubeSize;
-			for (var x = i32(local_id.x); x < sharedMemorySize.x; x += workgroupSize.x) {
-				let gx = wrapCoord(base.x + x);
-				let s = vec3i(x, y, z);
-
-				let globalIndex = gx + gy + gz;
-				let sharedIndex = flatten_index(s, sharedMemorySize);
-				shared_memory[sharedIndex] = readBuffer[globalIndex];
-			}
-		}
-	}
-
-	workgroupBarrier();
-
-	let shared_idx = vec3i(local_id) + vec3i(range);
-	let shared_flat_index = flatten_index(shared_idx, sharedMemorySize);
-	let current_state = shared_memory[shared_flat_index];
-	*/
-
-	var count = 0u;
-
-	let next_state = select(current_state + 1, 0, current_state + 1 == states);
-	const z_mul = sharedMemorySize.x*sharedMemorySize.y;
-	const y_mul = sharedMemorySize.x;
-	for (var z = -(range * z_mul); z <= (range * z_mul); z += z_mul) {
-		for (var y = -(range * y_mul); y <= (range * y_mul); y += y_mul) {
-			for (var x = -range; x <= range; x += 1) {
-				if (z == 0 && y == 0 && x == 0) { continue; }
-				let index = z + y + x + shared_flat_index;
-
-				count += u32(shared_memory[index] == next_state);
-			}
-		}
-	}
-	writeBuffer[idx] = select(current_state, next_state, count >= threshold);
 }
 
 fn cca_basic_4x(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
@@ -282,6 +246,72 @@ fn cca_basic_4x(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	writeBuffer[idx] = out;
 }
 
+fn cca_packed(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
+	let idx = id.z * (cubeSize * packedCubeSize) + id.y * packedCubeSize + id.x;
+	let packedStates = readBuffer[idx];
+
+	var currentStates = array<u32, packedValueCount>();
+	var nextStates = array<u32, packedValueCount>();
+
+	for (var i = 0u; i < packedValueCount; i += 1) {
+		let state = (packedStates >> (i * packedValueSize)) & packedValueMask;
+		let nextState = select(state + 1, 0, state + 1 == states);
+		currentStates[i] = state;
+		nextStates[i] = nextState;
+	}
+
+	let baseX = i32(id.x) - 1;
+
+	var counts = array<u32, packedValueCount>();
+
+	for (var z = -range; z <= range; z += 1) {
+		let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
+		for (var y = -range; y <= range; y += 1) {
+			let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+
+			var adjacentStates = array<u32, 3>();
+			adjacentStates[0] = readBuffer[nz + ny + wrapCoordPacked(baseX)];
+			adjacentStates[1] = readBuffer[nz + ny + wrapCoordPacked(baseX + 1)];
+			adjacentStates[2] = readBuffer[nz + ny + wrapCoordPacked(baseX + 2)];
+
+			for (var i = 0u; i < packedValueCount; i += 1) {
+				var c = 0u;
+				let nextState = nextStates[i];
+
+				if (i == 0) {
+					let leftState = adjacentStates[0] >> (32 - packedValueSize);
+					c += u32(leftState == nextState);
+				} else {
+					let leftState = (adjacentStates[1] >> ((i - 1) * packedValueSize)) & packedValueMask;
+					c += u32(leftState == nextState);
+				}
+
+				if (z != 0 || y != 0) {
+					c += u32(((adjacentStates[1] >> (i * packedValueSize)) & packedValueMask) == nextState);
+				}
+
+				if (i == packedValueCount - 1) {
+					let rightState = adjacentStates[2] & packedValueMask;
+					c += u32(rightState == nextState);
+				} else {
+					let rightState = (adjacentStates[1] >> ((i + 1) * packedValueSize)) & packedValueMask;
+					c += u32(rightState == nextState);
+				}
+
+				counts[i] += c;
+			}
+
+		}
+	}
+
+	var out = 0u;
+	for (var i = 0u; i < packedValueCount; i += 1) {
+		let newState = select(currentStates[i], nextStates[i], counts[i] >= threshold);
+		out |= newState << (i * packedValueSize);
+	}
+	writeBuffer[idx] = out;
+}
+
 @compute
 @workgroup_size(${workgroupX}, ${workgroupY}, ${workgroupZ})
 fn cs_main(
@@ -290,7 +320,7 @@ fn cs_main(
 	@builtin(workgroup_id) workgroup_id : vec3<u32>
 ) {
 	if (usePackedValues) {
-		cca_basic_4x(id, local_id, workgroup_id);
+		cca_packed(id, local_id, workgroup_id);
 	} else {
 		cca_basic(id, local_id, workgroup_id);
 	}
@@ -360,32 +390,46 @@ const uniformBuffer = device.createBuffer({
 	usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
 
-const elementSize = (usePackedValues) ? 1 : 4;
+const bufferSize = cubeSize** 2 * (usePackedValues ? packedCubeSize : cubeSize) * 4;
 const buffers = [
 	device.createBuffer({
 		mappedAtCreation: true,
-		size: cubeSize**3 * elementSize,
+		size: bufferSize,
 		usage: GPUBufferUsage.STORAGE,
 	}),
 	device.createBuffer({
-		size: cubeSize**3 * elementSize,
+		size: bufferSize,
 		usage: GPUBufferUsage.STORAGE
 	})
 ];
 
+function mulberry32(seed) {
+	let t = seed;
+	return function() {
+		t |= 0;
+		t = t + 0x6D2B79F5 | 0;
+		let r = Math.imul(t ^ t >>> 15, 1 | t);
+		r = r + Math.imul(r ^ r >>> 7, 61 | r) ^ r;
+		return ((r ^ r >>> 14) >>> 0) / 4294967296;
+	};
+}
+
+const deterministicRandomness = false;
+const rand = (deterministicRandomness) ? mulberry32(12345) : Math.random;
+
 {
 	const initialBufferData = new Uint32Array(buffers[0].getMappedRange());
 	if (usePackedValues) {
-		for (let i = 0; i < initialBufferData.length; ++i) {
-			const r0 = Math.floor(Math.random() * states) << 0;
-			const r1 = Math.floor(Math.random() * states) << 8;
-			const r2 = Math.floor(Math.random() * states) << 16;
-			const r3 = Math.floor(Math.random() * states) << 24;
-			initialBufferData[i] = r0 | r1 | r2 | r3;
+		for (let i = 0; i < bufferSize; ++i) {
+			let r = 0;
+			for (let j = 0; j < packedValueCount; ++j) {
+				r |= Math.floor(rand() * states) << (j * packedValueSize);
+			}
+			initialBufferData[i] = r;
 		}
 	} else {
 		for (let i = 0; i < cubeSize**3; ++i) {
-			initialBufferData[i] = Math.random() * states;
+			initialBufferData[i] = rand() * states;
 		}
 	}
 	buffers[0].unmap();
@@ -578,7 +622,7 @@ async function writeResults(frameIndex) {
 		) * inverse_length;
 		const std_dev = Math.sqrt(variance);
 		// console.log(`Compute Pass: ${sorted_times[50].toFixed(2)}ms`);
-		console.log(`Compute Pass\nMedian: ${median}\nWorst: ${worst}\nBest:${best}\nMean: ${mean.toFixed(2)}\nStandard Deviation:${std_dev.toFixed(2)}`);
+		console.log(`Compute Pass\nMedian: ${median}\nWorst: ${worst}\nBest:${best}\nMean: ${mean.toFixed(2)}\nStandard Deviation: ${std_dev.toFixed(2)}`);
 	}
 	// console.log(`Frame ${frameIndex} - Render Pass: ${renderPassDurationMS}ms - Compute Pass: ${computePassDurationMS}ms`);
 }
@@ -649,7 +693,7 @@ async function frame(currentTime) {
 		pass.setBindGroup(0, renderUniformBindGroup);
 		pass.setBindGroup(1, computeBindGroups[bindGroupIndex]);
 		if (usePackedValues) {
-			pass.dispatchWorkgroups(cubeSize / workgroupX / 4, cubeSize / workgroupY, cubeSize / workgroupZ);
+			pass.dispatchWorkgroups(cubeSize / workgroupX / packedValueCount, cubeSize / workgroupY, cubeSize / workgroupZ);
 		} else {
 			pass.dispatchWorkgroups(cubeSize / workgroupX, cubeSize / workgroupY, cubeSize / workgroupZ);
 		}
@@ -668,8 +712,8 @@ async function frame(currentTime) {
 	if (useBenchmarks && !writingBenchmarkResults) {
 		writeResults(frameIndex);
 	}
-	requestAnimationFrame(frame);
 
+	requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
