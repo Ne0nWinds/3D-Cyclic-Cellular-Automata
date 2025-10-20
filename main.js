@@ -28,7 +28,10 @@ const cubeSizeSq = cubeSize**2;
 
 const workgroupX = 8;
 const workgroupY = 4;
-const workgroupZ = 4;
+const workgroupZ = 2;
+const usePackedValues = false;
+
+const packedCubeSize = cubeSize / 4;
 
 const shaderModule = device.createShaderModule({
 	code:
@@ -79,6 +82,7 @@ fn hsl(h: f32, s: f32, l: f32) -> vec3f {
 
 const cubeSize = ${cubeSize};
 const cubeSizeSq = ${cubeSizeSq};
+const packedCubeSize = ${packedCubeSize};
 
 @vertex
 fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f) -> VSOut {
@@ -92,14 +96,34 @@ fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f
 
 @fragment
 fn fs_main(@location(0) cube_pos : vec3f) -> @location(0) vec4f {
-	let index3D = vec3<i32>(cube_pos * cubeSize);
-	let flatIndex = index3D.z*cubeSizeSq + index3D.y*cubeSize + index3D.x;
 
-	let current_state = readBuffer[flatIndex];
+	var current_state = 0u;
+	if (usePackedValues) {
+		let index3D = vec3f(cube_pos * vec3f(packedCubeSize, cubeSize, cubeSize));
+		let flatIndex = u32(index3D.z)*(cubeSize * packedCubeSize) + u32(index3D.y)*packedCubeSize + u32(index3D.x);
+		let bitIndex = u32(index3D.x * 4.0);
+		current_state = (readBuffer[flatIndex] >> (bitIndex * 8)) & 0xFF;
+	} else {
+		let index3D = vec3<i32>(cube_pos * cubeSize);
+		let flatIndex = index3D.z*cubeSizeSq + index3D.y*cubeSize + index3D.x;
+		current_state = readBuffer[flatIndex];
+	}
 	// let c = hsl(f32(current_state) / f32(states) * 0.25 + 0.5, 0.75, 0.5);
 	let c = vec3f(f32(current_state) / f32(states));
 	return vec4f(c, 1.0);
 }
+
+
+const usePackedValues = ${usePackedValues ? "true" : "false"};
+const states = ${states};
+const threshold = ${threshold};
+const range = 1;
+
+const workgroupSize = vec3i(${workgroupX}, ${workgroupY}, ${workgroupZ});
+const sharedMemorySize = vec3i(${workgroupX } + range*2, ${workgroupY} + range*2, ${workgroupZ} + range*2);
+const totalSharedMemorySize = sharedMemorySize.x * sharedMemorySize.y * sharedMemorySize.z;
+
+var<workgroup> shared_memory : array<u32, totalSharedMemorySize>;
 
 fn wrapCoord(n: i32) -> i32 {
 	if (n >= cubeSize) { return n - cubeSize; };
@@ -107,20 +131,15 @@ fn wrapCoord(n: i32) -> i32 {
 	return n;
 }
 
-const states = ${states};
-const threshold = ${threshold};
-
-const workgroupSize = vec3i(${workgroupX}, ${workgroupY}, ${workgroupZ});
-const sharedMemorySize = vec3i(${workgroupX + 2}, ${workgroupY + 2}, ${workgroupZ + 2});
-const totalSharedMemorySize = sharedMemorySize.x * sharedMemorySize.y * sharedMemorySize.z;
-
-var<workgroup> shared_memory : array<u32, totalSharedMemorySize>;
+fn wrapCoordPacked(n: i32) -> i32 {
+	if (n >= (packedCubeSize)) { return n - (packedCubeSize); };
+	if (n < 0) { return n + (packedCubeSize); };
+	return n;
+}
 
 fn wrapCoords(coords: vec3i) -> vec3i {
 	return vec3i(wrapCoord(coords.x), wrapCoord(coords.y), wrapCoord(coords.z));
 }
-
-const range = 1;
 
 fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	let idx = id.z * cubeSizeSq + id.y * cubeSize + id.x;
@@ -131,7 +150,6 @@ fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 		for (var y = -range; y <= range; y += 1) {
 			for (var x = -range; x <= range; x += 1) {
 				if (z == 0 && y == 0 && x == 0) { continue; }
-
 				let nz = wrapCoord(z + i32(id.z));
 				let ny = wrapCoord(y + i32(id.y));
 				let nx = wrapCoord(x + i32(id.x));
@@ -144,51 +162,124 @@ fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	}
 	writeBuffer[idx] = select(current_state, next_state, count >= threshold);
 }
+
+fn flatten_index(index: vec3i, dimensions: vec3i) -> i32 {
+	return (index.z*(dimensions.x*dimensions.y)) + index.y*dimensions.x + index.x;
+}
+
 fn cca_shared(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	let idx = id.z * cubeSizeSq + id.y * cubeSize + id.x;
 
+	let shared_idx = vec3i(local_id) + vec3i(range);
+	let shared_flat_index = flatten_index(shared_idx, sharedMemorySize);
+	let current_state = readBuffer[idx];
+	shared_memory[shared_flat_index] = current_state;
 
-	let base = wrapCoords(vec3i(workgroup_id) * workgroupSize - vec3i(1));
+	workgroupBarrier();
 
-	let flat_local_id = (i32(local_id.z)*workgroupSize.x*workgroupSize.y) + (i32(local_id.y) * workgroupSize.x) + i32(local_id.x);
-	for (var i = 0; i < totalSharedMemorySize; i += (workgroupSize.x*workgroupSize.y*workgroupSize.z)) {
-		let thread_index = i + flat_local_id;
-		let z = (thread_index / (sharedMemorySize.x * sharedMemorySize.y));
-		let xy = (thread_index % (sharedMemorySize.x * sharedMemorySize.y));
-		let y = xy / sharedMemorySize.x;
-		let x = xy % sharedMemorySize.x;
+	/*
+	let base = vec3i(workgroup_id) * workgroupSize - vec3i(range);
 
-		let global_index = wrapCoords(base + vec3i(x, y, z));
-		if (thread_index < totalSharedMemorySize) {
-			shared_memory[thread_index] = readBuffer[global_index.z * cubeSizeSq + global_index.y * cubeSize + global_index.x];
+	for (var z = i32(local_id.z); z < sharedMemorySize.z; z += workgroupSize.z) {
+		let gz = wrapCoord(base.z + z) * cubeSizeSq;
+		for (var y = i32(local_id.y); y < sharedMemorySize.y; y += workgroupSize.y) {
+			let gy = wrapCoord(base.y + y) * cubeSize;
+			for (var x = i32(local_id.x); x < sharedMemorySize.x; x += workgroupSize.x) {
+				let gx = wrapCoord(base.x + x);
+				let s = vec3i(x, y, z);
+
+				let globalIndex = gx + gy + gz;
+				let sharedIndex = flatten_index(s, sharedMemorySize);
+				shared_memory[sharedIndex] = readBuffer[globalIndex];
+			}
 		}
 	}
 
 	workgroupBarrier();
 
 	let shared_idx = vec3i(local_id) + vec3i(range);
-	let current_state = shared_memory[(shared_idx.z*sharedMemorySize.x*sharedMemorySize.y) + shared_idx.y*sharedMemorySize.x + shared_idx.x];
-	let next_state = select(current_state + 1, 0, current_state + 1 == states);
+	let shared_flat_index = flatten_index(shared_idx, sharedMemorySize);
+	let current_state = shared_memory[shared_flat_index];
+	*/
 
 	var count = 0u;
 
-	for (var z = -range; z <= range; z += 1) {
-		for (var y = -range; y <= range; y += 1) {
+	let next_state = select(current_state + 1, 0, current_state + 1 == states);
+	const z_mul = sharedMemorySize.x*sharedMemorySize.y;
+	const y_mul = sharedMemorySize.x;
+	for (var z = -(range * z_mul); z <= (range * z_mul); z += z_mul) {
+		for (var y = -(range * y_mul); y <= (range * y_mul); y += y_mul) {
 			for (var x = -range; x <= range; x += 1) {
 				if (z == 0 && y == 0 && x == 0) { continue; }
+				let index = z + y + x + shared_flat_index;
 
-				let nz = z + shared_idx.z;
-				let ny = y + shared_idx.y;
-				let nx = x + shared_idx.x;
-				let index = (nz * sharedMemorySize.x*sharedMemorySize.y) + (ny * sharedMemorySize.x) + nx;
-				if (shared_memory[index] == next_state) {
-					count += 1;
-				}
+				count += u32(shared_memory[index] == next_state);
 			}
 		}
 	}
-
 	writeBuffer[idx] = select(current_state, next_state, count >= threshold);
+}
+
+fn cca_basic_4x(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
+	let idx = id.z * (cubeSize * packedCubeSize) + id.y * packedCubeSize + id.x;
+	let packedStates = readBuffer[idx];
+
+	let currentState0 = packedStates & 0xFF;
+	let currentState1 = (packedStates >> 8) & 0xFF;
+	let currentState2 = (packedStates >> 16) & 0xFF;
+	let currentState3 = (packedStates >> 24);
+
+	let nextState0 = select(currentState0 + 1, 0, currentState0 + 1 == states);
+	let nextState1 = select(currentState1 + 1, 0, currentState1 + 1 == states);
+	let nextState2 = select(currentState2 + 1, 0, currentState2 + 1 == states);
+	let nextState3 = select(currentState3 + 1, 0, currentState3 + 1 == states);
+
+	var count0 = 0u;
+	var count1 = 0u;
+	var count2 = 0u;
+	var count3 = 0u;
+
+	for (var z = -range; z <= range; z += 1) {
+		let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
+		for (var y = -range; y <= range; y += 1) {
+			let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+
+			let packedStates0 = readBuffer[nz + ny + wrapCoordPacked(i32(id.x) - 1)];
+			let packedStates1 = readBuffer[nz + ny + wrapCoordPacked(i32(id.x) + 0)];
+			let packedStates2 = readBuffer[nz + ny + wrapCoordPacked(i32(id.x) + 1)];
+
+			count0 += u32((packedStates0 >> 24) == nextState0);
+			if (z != 0 || y != 0) {
+				count0 += u32((packedStates1 & 0xFF) == nextState0);
+			}
+			count0 += u32(((packedStates1 >> 8) & 0xFF) == nextState0);
+
+			count1 += u32(((packedStates1 >> 0) & 0xFF) == nextState1);
+			if (z != 0 || y != 0) {
+				count1 += u32(((packedStates1 >> 8) & 0xFF) == nextState1);
+			}
+			count1 += u32(((packedStates1 >> 16) & 0xFF) == nextState1);
+
+			count2 += u32(((packedStates1 >> 8) & 0xFF) == nextState2);
+			if (z != 0 || y != 0) {
+				count2 += u32(((packedStates1 >> 16) & 0xFF) == nextState2);
+			}
+			count2 += u32(((packedStates1 >> 24) & 0xFF) == nextState2);
+
+			count3 += u32(((packedStates1 >> 16) & 0xFF) == nextState3);
+			if (z != 0 || y != 0) {
+				count3 += u32(((packedStates1 >> 24) & 0xFF) == nextState3);
+			}
+			count3 += u32(((packedStates2 >> 0) & 0xFF) == nextState3);
+		}
+	}
+
+	var out = 0u;
+	out |= select(currentState0, nextState0, count0 >= threshold);
+	out |= select(currentState1, nextState1, count1 >= threshold) << 8;
+	out |= select(currentState2, nextState2, count2 >= threshold) << 16;
+	out |= select(currentState3, nextState3, count3 >= threshold) << 24;
+	writeBuffer[idx] = out;
 }
 
 @compute
@@ -198,9 +289,12 @@ fn cs_main(
 	@builtin(local_invocation_id) local_id: vec3<u32>,
 	@builtin(workgroup_id) workgroup_id : vec3<u32>
 ) {
-	cca_shared(id, local_id, workgroup_id);
+	if (usePackedValues) {
+		cca_basic_4x(id, local_id, workgroup_id);
+	} else {
+		cca_basic(id, local_id, workgroup_id);
+	}
 }
-
 `
 });
 
@@ -265,22 +359,34 @@ const uniformBuffer = device.createBuffer({
 	size: 32 * 3,
 	usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
+
+const elementSize = (usePackedValues) ? 1 : 4;
 const buffers = [
 	device.createBuffer({
 		mappedAtCreation: true,
-		size: cubeSize**3 * 4,
+		size: cubeSize**3 * elementSize,
 		usage: GPUBufferUsage.STORAGE,
 	}),
 	device.createBuffer({
-		size: cubeSize**3 * 4,
+		size: cubeSize**3 * elementSize,
 		usage: GPUBufferUsage.STORAGE
 	})
 ];
 
 {
 	const initialBufferData = new Uint32Array(buffers[0].getMappedRange());
-	for (let i = 0; i < cubeSize**3; ++i) {
-		initialBufferData[i] = Math.random() * states;
+	if (usePackedValues) {
+		for (let i = 0; i < initialBufferData.length; ++i) {
+			const r0 = Math.floor(Math.random() * states) << 0;
+			const r1 = Math.floor(Math.random() * states) << 8;
+			const r2 = Math.floor(Math.random() * states) << 16;
+			const r3 = Math.floor(Math.random() * states) << 24;
+			initialBufferData[i] = r0 | r1 | r2 | r3;
+		}
+	} else {
+		for (let i = 0; i < cubeSize**3; ++i) {
+			initialBufferData[i] = Math.random() * states;
+		}
 	}
 	buffers[0].unmap();
 }
@@ -364,7 +470,7 @@ const renderPipeline = device.createRenderPipeline({
 	},
 	depthStencil: {
 		format: "depth24plus",
-		depthWriteEnabled: true,
+		depthWriteEnabled: false,
 		depthCompare: "less"
 	}
 });
@@ -431,8 +537,14 @@ let depthView;
 
 const start = document.timeline.currentTime;
 
-const frameSkip = 4;
+const frameSkip = 1;
 let frameIndex = -1;
+const useBenchmarks = true;
+
+const samples = 128;
+const times = new Float64Array(samples);
+let timesIndex = 0;
+let sufficientData = false;
 
 let writingBenchmarkResults = false;
 async function writeResults(frameIndex) {
@@ -447,7 +559,28 @@ async function writeResults(frameIndex) {
 	const granularity = 1000;
 	const renderPassDurationMS = Number(renderPassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
 	const computePassDurationMS = Number(computePassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
-	console.log(`Frame ${frameIndex} - Render Pass: ${renderPassDurationMS}ms - Compute Pass: ${computePassDurationMS}ms`);
+	times[timesIndex] = computePassDurationMS;
+	timesIndex = (timesIndex + 1) % samples;
+	if (timesIndex == 0) sufficientData = true;
+
+	if (sufficientData) {
+		const sorted_times = new Float64Array(samples);
+		sorted_times.set(times, 0);
+		sorted_times.sort((a, b) => a - b); // ascending
+
+		const median = sorted_times[Math.floor(samples / 2)].toFixed(2);
+		const worst = sorted_times[samples - 1].toFixed(2);
+		const best = sorted_times[0].toFixed(2);
+		const inverse_length = 1.0 / samples;
+		const mean = sorted_times.reduce((a, b) => a + b) * inverse_length;
+		const variance = sorted_times.reduce((a, b) =>
+			a + (b - mean)**2
+		) * inverse_length;
+		const std_dev = Math.sqrt(variance);
+		// console.log(`Compute Pass: ${sorted_times[50].toFixed(2)}ms`);
+		console.log(`Compute Pass\nMedian: ${median}\nWorst: ${worst}\nBest:${best}\nMean: ${mean.toFixed(2)}\nStandard Deviation:${std_dev.toFixed(2)}`);
+	}
+	// console.log(`Frame ${frameIndex} - Render Pass: ${renderPassDurationMS}ms - Compute Pass: ${computePassDurationMS}ms`);
 }
 
 async function frame(currentTime) {
@@ -504,7 +637,7 @@ async function frame(currentTime) {
 		pass.draw(36, 1);
 		pass.end();
 	}
-	if (frameIndex % frameSkip != 0) {
+	if (frameIndex % frameSkip == 0) {
 		const pass = encoder.beginComputePass({
 			timestampWrites: {
 				querySet,
@@ -515,17 +648,24 @@ async function frame(currentTime) {
 		pass.setPipeline(computePipeline);
 		pass.setBindGroup(0, renderUniformBindGroup);
 		pass.setBindGroup(1, computeBindGroups[bindGroupIndex]);
-		pass.dispatchWorkgroups(cubeSize / workgroupX, cubeSize / workgroupY, cubeSize / workgroupZ);
+		if (usePackedValues) {
+			pass.dispatchWorkgroups(cubeSize / workgroupX / 4, cubeSize / workgroupY, cubeSize / workgroupZ);
+		} else {
+			pass.dispatchWorkgroups(cubeSize / workgroupX, cubeSize / workgroupY, cubeSize / workgroupZ);
+		}
 		pass.end();
 		bindGroupIndex ^= 1;
-	}
-	encoder.resolveQuerySet(querySet, 0, 4, queryBuffer, 0);
-	if (!writingBenchmarkResults) {
-		encoder.copyBufferToBuffer(queryBuffer, 0, queryBufferCPU, 0, 256);
+
+		if (useBenchmarks) {
+			encoder.resolveQuerySet(querySet, 0, 4, queryBuffer, 0);
+			if (!writingBenchmarkResults) {
+				encoder.copyBufferToBuffer(queryBuffer, 0, queryBufferCPU, 0, 256);
+			}
+		}
 	}
 
 	device.queue.submit([encoder.finish()]);
-	if (!writingBenchmarkResults) {
+	if (useBenchmarks && !writingBenchmarkResults) {
 		writeResults(frameIndex);
 	}
 	requestAnimationFrame(frame);
