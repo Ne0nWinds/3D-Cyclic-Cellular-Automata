@@ -21,20 +21,20 @@ context.configure({
 	alphaMode: "opaque"
 });
 
-const states = 5;
-const threshold = 8;
-const cubeSize = 256;
+const states = 7;
+const threshold = 6;
+const cubeSize = 128;
 const cubeSizeSq = cubeSize**2;
 
 const workgroupX = 8;
 const workgroupY = 4;
 const workgroupZ = 2;
-const usePackedValues = true;
+const usePackedValues = false;
 
 const packedValueSize = 4;
 const packedValueCount = Math.floor(32 / packedValueSize);
 const packedValueMask = ((1 << packedValueSize) - 1) | 0;
-const packedCubeSize = cubeSize / packedValueCount;
+const packedCubeSize = Math.floor(cubeSize / packedValueCount);
 
 function downloadCanvasPNG(namePrefix = "canvas") {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -56,11 +56,13 @@ const shaderModule = device.createShaderModule({
 struct VSOut {
 	@builtin(position) position: vec4f,
 	
-	@location(0) cube_pos: vec3f
+	@location(0) cube_pos: vec3f,
+	@location(1) world_pos: vec3f
 };
 
 struct Constants {
 	mvp: mat4x4<f32>,
+	eye_pos: vec3<f32>,
 	time: f32,
 	padding0: f32,
 	padding1: f32,
@@ -107,30 +109,44 @@ const packedCubeSize = ${packedCubeSize};
 
 @vertex
 fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f) -> VSOut {
-	var pos = in_pos;
+	let pos = in_pos;
 
 	var out: VSOut;
 	out.position = constants.mvp * vec4f(pos, 1.0);
-	out.cube_pos = (pos + 0.5) * (1023.0 / 1024.0);
+	out.cube_pos = (pos + 0.5) * (2047.0 / 2048.0);
+	out.world_pos = pos;
 	return out;
 }
 
 @fragment
-fn fs_main(@location(0) cube_pos : vec3f) -> @location(0) vec4f {
+fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @location(0) vec4f {
 
-	var current_state = 0u;
+	var voxel_state = 0u;
 	if (usePackedValues) {
 		let index3D = vec3f(cube_pos * vec3f(packedCubeSize, cubeSize, cubeSize));
 		let flatIndex = u32(index3D.z)*(cubeSize * packedCubeSize) + u32(index3D.y)*packedCubeSize + u32(index3D.x);
 		let bitIndex = u32(index3D.x * f32(packedValueCount));
-		current_state = (readBuffer[flatIndex] >> (bitIndex * packedValueSize)) & packedValueMask;
+		voxel_state = (readBuffer[flatIndex] >> (bitIndex * packedValueSize)) & packedValueMask;
 	} else {
-		let index3D = vec3<i32>(cube_pos * cubeSize);
-		let flatIndex = index3D.z*cubeSizeSq + index3D.y*cubeSize + index3D.x;
-		current_state = readBuffer[flatIndex];
+		var rayPosition = vec3f(cube_pos * cubeSize);
+		let rayDirection = normalize(world_pos - constants.eye_pos);
+		var flatIndex = u32(rayPosition.z)*cubeSizeSq + u32(rayPosition.y)*cubeSize + u32(rayPosition.x);
+
+		voxel_state = readBuffer[flatIndex];
+
+		while (voxel_state >= 0 && voxel_state <= 2) {
+			rayPosition += rayDirection * 0.5;
+			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
+				return vec4f(vec3f(0.0), 1.0);
+			}
+			flatIndex = u32(rayPosition.z)*cubeSizeSq + u32(rayPosition.y)*cubeSize + u32(rayPosition.x);
+			voxel_state = readBuffer[flatIndex];
+		}
 	}
-	let c = hsl(f32(current_state) / f32(states) * 0.5 + 0.5, 0.65, 0.5);
-	// let c = vec3f(f32(current_state) / f32(states));
+
+	let c = hsl(f32(voxel_state) / f32(states) * 0.5 + 0.5, 0.65, 0.5);
+	// let c = vec3f(f32(voxel_state) / f32(states));
+	// let c = normalize(world_pos - constants.eye_pos);
 	return vec4f(c, 1.0);
 }
 
@@ -386,7 +402,7 @@ const vertexBuffer = device.createBuffer({
 let bufferIndex = 0;
 
 const uniformBuffer = device.createBuffer({
-	size: 32 * 3,
+	size: 256,
 	usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
 
@@ -583,7 +599,7 @@ const start = document.timeline.currentTime;
 
 const frameSkip = 1;
 let frameIndex = -1;
-const useBenchmarks = true;
+const useBenchmarks = false;
 
 const samples = 128;
 const times = new Float64Array(samples);
@@ -627,28 +643,40 @@ async function writeResults(frameIndex) {
 	// console.log(`Frame ${frameIndex} - Render Pass: ${renderPassDurationMS}ms - Compute Pass: ${computePassDurationMS}ms`);
 }
 
+function degreesToRadians(degrees) {
+	return degrees / 180.0 * Math.PI;
+}
+
+let runningSimulation = true;
+
+window
+
+window.onkeyup = (e) => {
+	if (e.key == " ") {
+		runningSimulation = !runningSimulation;
+	}
+}
+
 async function frame(currentTime) {
 
 	frameIndex += 1;
 
-	const elapsedTime = (currentTime - start) * (1.0 / 1024.0);
+	const time = (currentTime - start) * (1.0 / 1024.0);
 
 	{
-		const eye = vec3.create(Math.sin(0.5) * 1.5, 1.0, Math.cos(0.5) * 1.5);
+		const eye = vec3.create(Math.sin(degreesToRadians(30 * time)) * 1.5, 1.0, Math.cos(degreesToRadians(30 * time)) * 1.5);
 		const target = vec3.create(0, 0, 0);
 		const up = vec3.create(0, 1, 0);
 		const view = mat4.lookAt(eye, target, up);
-
 		const fovy = 60 * (Math.PI / 180);
 		const proj = mat4.perspective(fovy, canvas.width / canvas.height, 1/8, 1024);
+		const mvp = mat4.multiply(proj, view);
+		const inverse_view = mat4.inverse(view);
 
-		const model = mat4.identity();
-		const pv = mat4.multiply(proj, view);
-		const mvp = mat4.multiply(pv, model);
-
-		const upload = new Float32Array(20);
+		const upload = new Float32Array(16 + 4 + 4);
 		upload.set(mvp, 0);
-		upload[16] = elapsedTime;
+		upload.set(eye, 16);
+		upload[20] = time;
 		device.queue.writeBuffer(uniformBuffer, 0, upload);
 	}
 
@@ -681,7 +709,7 @@ async function frame(currentTime) {
 		pass.draw(36, 1);
 		pass.end();
 	}
-	if (frameIndex % frameSkip == 0) {
+	if (frameIndex % frameSkip == 0 && runningSimulation) {
 		const pass = encoder.beginComputePass({
 			timestampWrites: {
 				querySet,
