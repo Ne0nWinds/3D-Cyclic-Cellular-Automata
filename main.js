@@ -23,15 +23,15 @@ context.configure({
 
 const states = 7;
 const threshold = 6;
-const cubeSize = 128;
+const cubeSize = 256;
 const cubeSizeSq = cubeSize**2;
 
 const workgroupX = 8;
 const workgroupY = 4;
 const workgroupZ = 2;
-const usePackedValues = false;
+const usePackedValues = true;
 
-const packedValueSize = 4;
+const packedValueSize = 8;
 const packedValueCount = Math.floor(32 / packedValueSize);
 const packedValueMask = ((1 << packedValueSize) - 1) | 0;
 const packedCubeSize = Math.floor(cubeSize / packedValueCount);
@@ -121,15 +121,27 @@ fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f
 @fragment
 fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @location(0) vec4f {
 
+	let rayDirection = normalize(world_pos - constants.eye_pos);
+
 	var voxel_state = 0u;
 	if (usePackedValues) {
-		let index3D = vec3f(cube_pos * vec3f(packedCubeSize, cubeSize, cubeSize));
-		let flatIndex = u32(index3D.z)*(cubeSize * packedCubeSize) + u32(index3D.y)*packedCubeSize + u32(index3D.x);
-		let bitIndex = u32(index3D.x * f32(packedValueCount));
-		voxel_state = (readBuffer[flatIndex] >> (bitIndex * packedValueSize)) & packedValueMask;
+		var rayPosition = vec3f(cube_pos * vec3f(cubeSize));
+		var flatIndex = u32(rayPosition.z)*(packedCubeSize*cubeSize) + u32(rayPosition.y)*(packedCubeSize) + (u32(rayPosition.x) / packedValueCount);
+		var shiftAmount = (u32(rayPosition.x) % packedValueCount) * packedValueSize;
+
+		voxel_state = (readBuffer[flatIndex] >> shiftAmount) & packedValueMask;
+
+		while (voxel_state >= 0 && voxel_state <= 2) {
+			rayPosition += rayDirection * 0.5;
+			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
+				return vec4f(vec3f(0.0), 1.0);
+			}
+			flatIndex = u32(rayPosition.z)*(packedCubeSize*cubeSize) + u32(rayPosition.y)*(packedCubeSize) + (u32(rayPosition.x) / packedValueCount);
+			shiftAmount = (u32(rayPosition.x) % packedValueCount) * packedValueSize;
+			voxel_state = (readBuffer[flatIndex] >> shiftAmount) & packedValueMask;
+		}
 	} else {
 		var rayPosition = vec3f(cube_pos * cubeSize);
-		let rayDirection = normalize(world_pos - constants.eye_pos);
 		var flatIndex = u32(rayPosition.z)*cubeSizeSq + u32(rayPosition.y)*cubeSize + u32(rayPosition.x);
 
 		voxel_state = readBuffer[flatIndex];
@@ -599,7 +611,7 @@ const start = document.timeline.currentTime;
 
 const frameSkip = 1;
 let frameIndex = -1;
-const useBenchmarks = false;
+const useBenchmarks = true;
 
 const samples = 128;
 const times = new Float64Array(samples);
@@ -619,7 +631,7 @@ async function writeResults(frameIndex) {
 	const granularity = 1000;
 	const renderPassDurationMS = Number(renderPassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
 	const computePassDurationMS = Number(computePassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
-	times[timesIndex] = computePassDurationMS;
+	times[timesIndex] = renderPassDurationMS;
 	timesIndex = (timesIndex + 1) % samples;
 	if (timesIndex == 0) sufficientData = true;
 
