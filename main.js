@@ -23,7 +23,7 @@ context.configure({
 
 const states = 7;
 const threshold = 6;
-const cubeSize = 256;
+const cubeSize = 512;
 const cubeSizeSq = cubeSize**2;
 
 const workgroupX = 8;
@@ -31,7 +31,7 @@ const workgroupY = 4;
 const workgroupZ = 2;
 const usePackedValues = true;
 
-const packedValueSize = 8;
+const packedValueSize = 4;
 const packedValueCount = Math.floor(32 / packedValueSize);
 const packedValueMask = ((1 << packedValueSize) - 1) | 0;
 const packedCubeSize = Math.floor(cubeSize / packedValueCount);
@@ -212,68 +212,6 @@ fn flatten_index(index: vec3i, dimensions: vec3i) -> i32 {
 	return (index.z*(dimensions.x*dimensions.y)) + index.y*dimensions.x + index.x;
 }
 
-fn cca_basic_4x(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
-	let idx = id.z * (cubeSize * packedCubeSize) + id.y * packedCubeSize + id.x;
-	let packedStates = readBuffer[idx];
-
-	let currentState0 = packedStates & 0xFF;
-	let currentState1 = (packedStates >> 8) & 0xFF;
-	let currentState2 = (packedStates >> 16) & 0xFF;
-	let currentState3 = (packedStates >> 24);
-
-	let nextState0 = select(currentState0 + 1, 0, currentState0 + 1 == states);
-	let nextState1 = select(currentState1 + 1, 0, currentState1 + 1 == states);
-	let nextState2 = select(currentState2 + 1, 0, currentState2 + 1 == states);
-	let nextState3 = select(currentState3 + 1, 0, currentState3 + 1 == states);
-
-	var count0 = 0u;
-	var count1 = 0u;
-	var count2 = 0u;
-	var count3 = 0u;
-
-	for (var z = -range; z <= range; z += 1) {
-		let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
-		for (var y = -range; y <= range; y += 1) {
-			let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
-
-			let packedStates0 = readBuffer[nz + ny + wrapCoordPacked(i32(id.x) - 1)];
-			let packedStates1 = readBuffer[nz + ny + wrapCoordPacked(i32(id.x) + 0)];
-			let packedStates2 = readBuffer[nz + ny + wrapCoordPacked(i32(id.x) + 1)];
-
-			count0 += u32((packedStates0 >> 24) == nextState0);
-			if (z != 0 || y != 0) {
-				count0 += u32((packedStates1 & 0xFF) == nextState0);
-			}
-			count0 += u32(((packedStates1 >> 8) & 0xFF) == nextState0);
-
-			count1 += u32(((packedStates1 >> 0) & 0xFF) == nextState1);
-			if (z != 0 || y != 0) {
-				count1 += u32(((packedStates1 >> 8) & 0xFF) == nextState1);
-			}
-			count1 += u32(((packedStates1 >> 16) & 0xFF) == nextState1);
-
-			count2 += u32(((packedStates1 >> 8) & 0xFF) == nextState2);
-			if (z != 0 || y != 0) {
-				count2 += u32(((packedStates1 >> 16) & 0xFF) == nextState2);
-			}
-			count2 += u32(((packedStates1 >> 24) & 0xFF) == nextState2);
-
-			count3 += u32(((packedStates1 >> 16) & 0xFF) == nextState3);
-			if (z != 0 || y != 0) {
-				count3 += u32(((packedStates1 >> 24) & 0xFF) == nextState3);
-			}
-			count3 += u32(((packedStates2 >> 0) & 0xFF) == nextState3);
-		}
-	}
-
-	var out = 0u;
-	out |= select(currentState0, nextState0, count0 >= threshold);
-	out |= select(currentState1, nextState1, count1 >= threshold) << 8;
-	out |= select(currentState2, nextState2, count2 >= threshold) << 16;
-	out |= select(currentState3, nextState3, count3 >= threshold) << 24;
-	writeBuffer[idx] = out;
-}
-
 fn cca_packed(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	let idx = id.z * (cubeSize * packedCubeSize) + id.y * packedCubeSize + id.x;
 	let packedStates = readBuffer[idx];
@@ -288,7 +226,7 @@ fn cca_packed(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 		nextStates[i] = nextState;
 	}
 
-	let baseX = i32(id.x) - 1;
+	let baseX = i32(id.x) - ((range + packedValueCount - 1) / packedValueCount);
 
 	var counts = array<u32, packedValueCount>();
 
@@ -297,38 +235,27 @@ fn cca_packed(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 		for (var y = -range; y <= range; y += 1) {
 			let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
 
-			var adjacentStates = array<u32, 3>();
-			adjacentStates[0] = readBuffer[nz + ny + wrapCoordPacked(baseX)];
-			adjacentStates[1] = readBuffer[nz + ny + wrapCoordPacked(baseX + 1)];
-			adjacentStates[2] = readBuffer[nz + ny + wrapCoordPacked(baseX + 2)];
+			const len = 1 + ((range + (packedValueCount - 1)) / packedValueCount) * 2;
+
+			var adjacentStates = array<u32, len>();
+			for (var i = 0; i < len; i += 1) {
+				adjacentStates[i] = readBuffer[nz + ny + wrapCoordPacked(baseX + i)];
+			}
 
 			for (var i = 0u; i < packedValueCount; i += 1) {
 				var c = 0u;
 				let nextState = nextStates[i];
 
-				if (i == 0) {
-					let leftState = adjacentStates[0] >> (32 - packedValueSize);
-					c += u32(leftState == nextState);
-				} else {
-					let leftState = (adjacentStates[1] >> ((i - 1) * packedValueSize)) & packedValueMask;
-					c += u32(leftState == nextState);
+				for (var x = 0u; x <= range * 2; x += 1) {
+					const offset = (packedValueCount - (range % packedValueCount));
+					let localX = x + i + offset;
+					let states = adjacentStates[localX / packedValueCount];
+					let shiftAmount = (localX % packedValueCount) * packedValueSize;
+					let state = u32(states >> shiftAmount) & packedValueMask;
+					c += u32(state == nextState);
 				}
-
-				if (z != 0 || y != 0) {
-					c += u32(((adjacentStates[1] >> (i * packedValueSize)) & packedValueMask) == nextState);
-				}
-
-				if (i == packedValueCount - 1) {
-					let rightState = adjacentStates[2] & packedValueMask;
-					c += u32(rightState == nextState);
-				} else {
-					let rightState = (adjacentStates[1] >> ((i + 1) * packedValueSize)) & packedValueMask;
-					c += u32(rightState == nextState);
-				}
-
 				counts[i] += c;
 			}
-
 		}
 	}
 
@@ -631,7 +558,7 @@ async function writeResults(frameIndex) {
 	const granularity = 1000;
 	const renderPassDurationMS = Number(renderPassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
 	const computePassDurationMS = Number(computePassDuration * BigInt(granularity) / BigInt(1e6)) / granularity;
-	times[timesIndex] = renderPassDurationMS;
+	times[timesIndex] = computePassDurationMS;
 	timesIndex = (timesIndex + 1) % samples;
 	if (timesIndex == 0) sufficientData = true;
 
