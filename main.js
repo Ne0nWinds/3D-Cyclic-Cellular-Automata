@@ -23,7 +23,7 @@ context.configure({
 
 const states = 7;
 const threshold = 6;
-const cubeSize = 512;
+const cubeSize = 128;
 const cubeSizeSq = cubeSize**2;
 
 const workgroupX = 8;
@@ -107,6 +107,19 @@ const packedValueCount = ${packedValueCount};
 const packedValueMask = ${packedValueMask};
 const packedCubeSize = ${packedCubeSize};
 
+const roseSandPalette = array<vec3<f32>, 10>(
+    vec3<f32>(0.298, 0.000, 0.059), // deep wine rose
+    vec3<f32>(0.525, 0.063, 0.145), // rich rose red
+    vec3<f32>(0.741, 0.251, 0.275), // coral rose
+    vec3<f32>(0.878, 0.447, 0.408), // soft clay
+    vec3<f32>(0.949, 0.643, 0.510), // warm terracotta
+    vec3<f32>(0.925, 0.745, 0.588), // light sand
+    vec3<f32>(0.909, 0.800, 0.682), // beige tan
+    vec3<f32>(0.949, 0.870, 0.745), // pale cream
+    vec3<f32>(0.976, 0.925, 0.847), // warm ivory
+    vec3<f32>(0.988, 0.957, 0.909)  // off-white highlight
+);
+
 @vertex
 fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f) -> VSOut {
 	let pos = in_pos;
@@ -121,44 +134,73 @@ fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f
 @fragment
 fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @location(0) vec4f {
 
+	var rayPosition = vec3f(cube_pos * vec3f(cubeSize));
 	let rayDirection = normalize(world_pos - constants.eye_pos);
 
-	var voxel_state = 0u;
+	let delta = abs(1.0 / rayDirection);
+	let step = sign(rayDirection);
+
+	var sideDistance = vec3f(
+		select(fract(rayPosition.x), floor(rayPosition.x + 1.0) - rayPosition.x, rayDirection.x >= 0) * delta.x,
+		select(fract(rayPosition.y), floor(rayPosition.y + 1.0) - rayPosition.y, rayDirection.y >= 0) * delta.y,
+		select(fract(rayPosition.z), floor(rayPosition.z + 1.0) - rayPosition.z, rayDirection.z >= 0) * delta.z,
+	);
+
+	var voxel_state : u32;
 	if (usePackedValues) {
-		var rayPosition = vec3f(cube_pos * vec3f(cubeSize));
-		var flatIndex = u32(rayPosition.z)*(packedCubeSize*cubeSize) + u32(rayPosition.y)*(packedCubeSize) + (u32(rayPosition.x) / packedValueCount);
-		var shiftAmount = (u32(rayPosition.x) % packedValueCount) * packedValueSize;
-
-		voxel_state = (readBuffer[flatIndex] >> shiftAmount) & packedValueMask;
-
-		while (voxel_state >= 0 && voxel_state <= 2) {
-			rayPosition += rayDirection * 0.5;
-			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
-				return vec4f(vec3f(0.0), 1.0);
-			}
-			flatIndex = u32(rayPosition.z)*(packedCubeSize*cubeSize) + u32(rayPosition.y)*(packedCubeSize) + (u32(rayPosition.x) / packedValueCount);
-			shiftAmount = (u32(rayPosition.x) % packedValueCount) * packedValueSize;
+		loop {
+			let flatIndex = u32(rayPosition.z)*(packedCubeSize*cubeSize) + u32(rayPosition.y)*(packedCubeSize) + (u32(rayPosition.x) / packedValueCount);
+			let shiftAmount = (u32(rayPosition.x) % packedValueCount) * packedValueSize;
 			voxel_state = (readBuffer[flatIndex] >> shiftAmount) & packedValueMask;
-		}
-	} else {
-		var rayPosition = vec3f(cube_pos * cubeSize);
-		var flatIndex = u32(rayPosition.z)*cubeSizeSq + u32(rayPosition.y)*cubeSize + u32(rayPosition.x);
 
-		voxel_state = readBuffer[flatIndex];
+			if (!(voxel_state <= 2)) {
+				break;
+			}
 
-		while (voxel_state >= 0 && voxel_state <= 2) {
-			rayPosition += rayDirection * 0.5;
+			if (sideDistance.x < sideDistance.y && sideDistance.x < sideDistance.z) {
+				sideDistance.x += delta.x;
+				rayPosition.x += step.x;
+			} else if (sideDistance.y < sideDistance.z) {
+				sideDistance.y += delta.y;
+				rayPosition.y += step.y;
+			} else {
+				sideDistance.z += delta.z;
+				rayPosition.z += step.z;
+			}
 			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
 				return vec4f(vec3f(0.0), 1.0);
 			}
-			flatIndex = u32(rayPosition.z)*cubeSizeSq + u32(rayPosition.y)*cubeSize + u32(rayPosition.x);
+		}
+
+	} else {
+		loop {
+			let flatIndex = u32(rayPosition.z)*cubeSizeSq + u32(rayPosition.y)*cubeSize + u32(rayPosition.x);
 			voxel_state = readBuffer[flatIndex];
+
+			if (!(voxel_state >= 0 && voxel_state <= 2)) {
+				break;
+			}
+
+			if (sideDistance.x < sideDistance.y && sideDistance.x < sideDistance.z) {
+				sideDistance.x += delta.x;
+				rayPosition.x += step.x;
+			} else if (sideDistance.y < sideDistance.x && sideDistance.y < sideDistance.z) {
+				sideDistance.y += delta.y;
+				rayPosition.y += step.y;
+			} else {
+				sideDistance.z += delta.z;
+				rayPosition.z += step.z;
+			}
+			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
+				return vec4f(vec3f(0.0), 1.0);
+			}
 		}
 	}
 
-	let c = hsl(f32(voxel_state) / f32(states) * 0.5 + 0.5, 0.65, 0.5);
+	// let c = hsl(f32(voxel_state) / f32(states) * 0.5 + 0.5, 0.65, 0.5);
 	// let c = vec3f(f32(voxel_state) / f32(states));
 	// let c = normalize(world_pos - constants.eye_pos);
+	let c = roseSandPalette[voxel_state];
 	return vec4f(c, 1.0);
 }
 
