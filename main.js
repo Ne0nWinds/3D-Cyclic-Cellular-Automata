@@ -22,14 +22,15 @@ context.configure({
 });
 
 const states = 7;
-const threshold = 6;
-const cubeSize = 128;
+const threshold = 7;
+const cubeSize = 64;
 const cubeSizeSq = cubeSize**2;
 
 const workgroupX = 8;
 const workgroupY = 4;
 const workgroupZ = 2;
 const usePackedValues = true;
+const vonNeumannNeighborhood = false;
 
 const packedValueSize = 4;
 const packedValueCount = Math.floor(32 / packedValueSize);
@@ -206,6 +207,7 @@ fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @loca
 
 
 const usePackedValues = ${usePackedValues ? "true" : "false"};
+const vonNeumannNeighborhood = ${vonNeumannNeighborhood ? "true" : "false"};
 const states = ${states};
 const threshold = ${threshold};
 const range = 1;
@@ -233,16 +235,33 @@ fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	let current_state = readBuffer[idx];
 	let next_state = select(current_state + 1, 0, current_state + 1 == states);
 	var count = 0u;
-	for (var z = -range; z <= range; z += 1) {
-		for (var y = -range; y <= range; y += 1) {
-			for (var x = -range; x <= range; x += 1) {
-				if (z == 0 && y == 0 && x == 0) { continue; }
-				let nz = wrapCoord(z + i32(id.z));
-				let ny = wrapCoord(y + i32(id.y));
-				let nx = wrapCoord(x + i32(id.x));
-				let index = (nz*cubeSizeSq) + (ny*cubeSize) + nx;
-				if (readBuffer[index] == next_state) {
-					count += 1u;
+	if (vonNeumannNeighborhood) {
+		for (var z = -range; z <= range; z += 1) {
+			let nz = wrapCoord(z + i32(id.z)) * cubeSizeSq;
+			let ySearch = range - abs(z);
+			for (var y = -ySearch; y <= ySearch; y += 1) {
+				let ny = wrapCoord(y + i32(id.y)) * cubeSize;
+				let xSearch = range - abs(y) - abs(z);
+				for (var x = -xSearch; x <= xSearch; x += 1) {
+					if (z == 0 && y == 0 && x == 0) { continue; }
+					let nx = wrapCoord(x + i32(id.x));
+					if (readBuffer[nz + ny + nx] == next_state) {
+						count += 1u;
+					}
+				}
+			}
+		}
+	} else {
+		for (var z = -range; z <= range; z += 1) {
+			let nz = wrapCoord(z + i32(id.z)) * cubeSizeSq;
+			for (var y = -range; y <= range; y += 1) {
+				let ny = wrapCoord(y + i32(id.y)) * cubeSize;
+				for (var x = -range; x <= range; x += 1) {
+					if (z == 0 && y == 0 && x == 0) { continue; }
+					let nx = wrapCoord(x + i32(id.x));
+					if (readBuffer[nz + ny + nx] == next_state) {
+						count += 1u;
+					}
 				}
 			}
 		}
@@ -268,35 +287,68 @@ fn cca_packed(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 		nextStates[i] = nextState;
 	}
 
-	let baseX = i32(id.x) - ((range + packedValueCount - 1) / packedValueCount);
-
 	var counts = array<u32, packedValueCount>();
 
-	for (var z = -range; z <= range; z += 1) {
-		let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
-		for (var y = -range; y <= range; y += 1) {
-			let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+	if (vonNeumannNeighborhood) {
+		for (var z = -range; z <= range; z += 1) {
+			let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
+			let yRange = range - abs(z);
+			for (var y = -yRange; y <= yRange; y += 1) {
+				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
 
-			const len = 1 + ((range + (packedValueCount - 1)) / packedValueCount) * 2;
+				const maxLength = 1 + ((range + (packedValueCount - 1)) / packedValueCount) * 2;
+				var adjacentStates = array<u32, maxLength>();
+				let xRange = range - abs(y) - abs(z);
+				let baseX = i32(id.x) - ((xRange + packedValueCount - 1) / packedValueCount);
+				let len = 1 + ((xRange + (packedValueCount - 1)) / packedValueCount) * 2;
+				let offset = (packedValueCount - (xRange % packedValueCount)) % packedValueCount;
 
-			var adjacentStates = array<u32, len>();
-			for (var i = 0; i < len; i += 1) {
-				adjacentStates[i] = readBuffer[nz + ny + wrapCoordPacked(baseX + i)];
-			}
-
-			for (var i = 0u; i < packedValueCount; i += 1) {
-				var c = 0u;
-				let nextState = nextStates[i];
-
-				for (var x = 0u; x <= range * 2; x += 1) {
-					const offset = (packedValueCount - (range % packedValueCount));
-					let localX = x + i + offset;
-					let states = adjacentStates[localX / packedValueCount];
-					let shiftAmount = (localX % packedValueCount) * packedValueSize;
-					let state = u32(states >> shiftAmount) & packedValueMask;
-					c += u32(state == nextState);
+				for (var i = 0; i < len; i += 1) {
+					adjacentStates[i] = readBuffer[nz + ny + wrapCoordPacked(baseX + i)];
 				}
-				counts[i] += c;
+
+				for (var i = 0u; i < packedValueCount; i += 1) {
+					var c = 0u;
+					let nextState = nextStates[i];
+
+					for (var x = 0u; x <= u32(xRange * 2); x += 1) {
+						let localX = x + i + u32(offset);
+						let states = adjacentStates[localX / packedValueCount];
+						let shiftAmount = (localX % packedValueCount) * packedValueSize;
+						let state = u32(states >> shiftAmount) & packedValueMask;
+						c += u32(state == nextState);
+					}
+					counts[i] += c;
+				}
+			}
+		}
+	} else {
+		let baseX = i32(id.x) - ((range + packedValueCount - 1) / packedValueCount);
+		for (var z = -range; z <= range; z += 1) {
+			let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
+			for (var y = -range; y <= range; y += 1) {
+				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+
+				const len = 1 + ((range + (packedValueCount - 1)) / packedValueCount) * 2;
+				var adjacentStates = array<u32, len>();
+				for (var i = 0; i < len; i += 1) {
+					adjacentStates[i] = readBuffer[nz + ny + wrapCoordPacked(baseX + i)];
+				}
+
+				for (var i = 0u; i < packedValueCount; i += 1) {
+					var c = 0u;
+					let nextState = nextStates[i];
+
+					for (var x = 0u; x <= range * 2; x += 1) {
+						const offset = (packedValueCount - (range % packedValueCount)) % packedValueCount;
+						let localX = x + i + offset;
+						let states = adjacentStates[localX / packedValueCount];
+						let shiftAmount = (localX % packedValueCount) * packedValueSize;
+						let state = u32(states >> shiftAmount) & packedValueMask;
+						c += u32(state == nextState);
+					}
+					counts[i] += c;
+				}
 			}
 		}
 	}
@@ -387,7 +439,7 @@ const uniformBuffer = device.createBuffer({
 	usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
 
-const bufferSize = cubeSize** 2 * (usePackedValues ? packedCubeSize : cubeSize) * 4;
+const bufferSize = cubeSize**2 * (usePackedValues ? packedCubeSize : cubeSize) * 4;
 const buffers = [
 	device.createBuffer({
 		mappedAtCreation: true,
@@ -411,7 +463,7 @@ function mulberry32(seed) {
 	};
 }
 
-const deterministicRandomness = false;
+const deterministicRandomness = true;
 const rand = (deterministicRandomness) ? mulberry32(12345) : Math.random;
 
 {
@@ -577,10 +629,11 @@ let depthTexture;
 let depthView;
 
 const start = document.timeline.currentTime;
+let lastTime = start;
 
 const frameSkip = 1;
 let frameIndex = -1;
-const useBenchmarks = true;
+const useBenchmarks = false;
 
 const samples = 128;
 const times = new Float64Array(samples);
@@ -630,11 +683,28 @@ function degreesToRadians(degrees) {
 
 let runningSimulation = true;
 
-window
+let angleX = degreesToRadians(30);
+
+let moveLeft = false;
+let moveRight = false;
 
 window.onkeyup = (e) => {
 	if (e.key == " ") {
 		runningSimulation = !runningSimulation;
+	}
+	if (e.key == "ArrowLeft" || e.key == "a") {
+		moveLeft = false;
+	}
+	if (e.key == "ArrowRight" || e.key == "d") {
+		moveRight = false;
+	}
+}
+window.onkeydown = (e) => {
+	if (e.key == "ArrowLeft" || e.key == "a") {
+		moveLeft = true;
+	}
+	if (e.key == "ArrowRight" || e.key == "d") {
+		moveRight = true;
 	}
 }
 
@@ -643,9 +713,18 @@ async function frame(currentTime) {
 	frameIndex += 1;
 
 	const time = (currentTime - start) * (1.0 / 1024.0);
+	const dt = currentTime - lastTime;
+	lastTime = currentTime;
+
+	if (moveLeft) {
+		angleX -= dt / 256.0;
+	}
+	if (moveRight) {
+		angleX += dt / 256.0;
+	}
 
 	{
-		const eye = vec3.create(Math.sin(degreesToRadians(30 * time)) * 1.5, 1.0, Math.cos(degreesToRadians(30 * time)) * 1.5);
+		const eye = vec3.create(Math.sin(angleX) * 1.5, 1.0, Math.cos(angleX) * 1.5);
 		const target = vec3.create(0, 0, 0);
 		const up = vec3.create(0, 1, 0);
 		const view = mat4.lookAt(eye, target, up);
