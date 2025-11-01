@@ -22,9 +22,14 @@ context.configure({
 });
 
 const states = 7;
-const threshold = 7;
-const cubeSize = 64;
+const threshold = 15;
+const range = 2;
+const cubeSize = 256;
 const cubeSizeSq = cubeSize**2;
+
+
+// N 8, t 15, r 2, size: 256, moore
+// N 40, t 1, r 1, size: 512, neumann
 
 const workgroupX = 8;
 const workgroupY = 4;
@@ -32,7 +37,33 @@ const workgroupZ = 2;
 const usePackedValues = true;
 const vonNeumannNeighborhood = false;
 
-const packedValueSize = 4;
+const startRecording = false;
+const recordingResolution = 1024;
+
+function bitWidth(n) {
+	if (n == 0) {
+		return 1;
+	}
+	let width = 0;
+	while (n > 0) {
+		width += 1;
+		n = n >> 1;
+	}
+	return width;
+}
+function nextPowerOfTwo(n) {
+	if (n == 0) return 1;
+	n -= 1;
+	n |= n >> 1;
+	n |= n >> 2;
+	n |= n >> 4;
+	n |= n >> 8;
+	n |= n >> 16;
+	n += 1;
+	return n;
+}
+
+const packedValueSize = nextPowerOfTwo(bitWidth(states));
 const packedValueCount = Math.floor(32 / packedValueSize);
 const packedValueMask = ((1 << packedValueSize) - 1) | 0;
 const packedCubeSize = Math.floor(cubeSize / packedValueCount);
@@ -54,6 +85,10 @@ function downloadCanvasPNG(namePrefix = "canvas") {
 const shaderModule = device.createShaderModule({
 	code:
 `
+/*
+enable subgroups;
+*/
+
 struct VSOut {
 	@builtin(position) position: vec4f,
 	
@@ -121,6 +156,25 @@ const roseSandPalette = array<vec3<f32>, 10>(
     vec3<f32>(0.988, 0.957, 0.909)  // off-white highlight
 );
 
+const coralReef = array<vec3<f32>, 16>(
+    vec3f(0.941, 0.506, 0.396), // coral (#f08165)
+    vec3f(0.851, 0.408, 0.345), // red coral
+    vec3f(0.851, 0.298, 0.282), // reef red (#d95348)
+    vec3f(0.890, 0.596, 0.431), // sandy orange
+    vec3f(0.929, 0.765, 0.549), // pale sand
+    vec3f(0.812, 0.863, 0.725), // seafoam
+    vec3f(0.600, 0.855, 0.804), // turquoise light
+    vec3f(0.341, 0.741, 0.737), // cyan reef (#24aebb)
+    vec3f(0.239, 0.588, 0.624), // deep teal
+    vec3f(0.188, 0.435, 0.529), // ocean shadow
+    vec3f(0.231, 0.396, 0.569), // deep blue violet
+    vec3f(0.361, 0.435, 0.647), // periwinkle
+    vec3f(0.569, 0.506, 0.682), // soft lavender coral
+    vec3f(0.729, 0.545, 0.655), // shell pink
+    vec3f(0.824, 0.529, 0.553), // rose coral
+    vec3f(0.941, 0.506, 0.396)  // wrap back to coral
+);
+
 @vertex
 fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f) -> VSOut {
 	let pos = in_pos;
@@ -132,20 +186,76 @@ fn vs_main(@builtin(instance_index) instance_id: u32, @location(0) in_pos: vec3f
 	return out;
 }
 
+// Source: https://www.shadertoy.com/view/XtGGzG
+fn magma_quintic(x_in: f32) -> vec3<f32> {
+    let x  = clamp(x_in, 0.0, 1.0);
+    let x1 = vec4<f32>(1.0, x, x * x, x*x*x);
+    let x2 = x1 * x1.w * x;
+
+    let r = dot(x1, vec4<f32>(-0.023226960,  1.087154378, -0.109964741,  6.333665763))
+          + dot(x2.xy, vec2<f32>(-11.640596589,  5.337625354));
+
+    let g = dot(x1, vec4<f32>( 0.010680993,  0.176613780,  1.638227448, -6.743522237))
+          + dot(x2.xy, vec2<f32>( 11.426396979, -5.523236379));
+
+    let b = dot(x1, vec4<f32>(-0.008260782,  2.244286052,  3.005587601, -24.279769818))
+          + dot(x2.xy, vec2<f32>( 32.484310068, -12.688259703));
+
+    return saturate(vec3f(r, g, b));
+}
+
+fn viridis_quintic(x_in: f32) -> vec3<f32> {
+    let x  = saturate(x_in);
+    let x1 = vec4<f32>(1.0, x, x * x, x * x * x);  // 1, x, x^2, x^3
+    let x2 = x1 * x1.w * x;                        // x^4, x^5, x^6, x^7
+
+    let r = dot(x1, vec4<f32>( 0.280268003, -0.143510503,  2.225793877, -14.815088879))
+          + dot(x2.xy, vec2<f32>(25.212752309, -11.772589584));
+
+    let g = dot(x1, vec4<f32>(-0.002117546,  1.617109353, -1.909305070,   2.701152864))
+          + dot(x2.xy, vec2<f32>(-1.685288385,  0.178738871));
+
+    let b = dot(x1, vec4<f32>( 0.300805501,  2.614650302, -12.019139090,  28.933559110))
+          + dot(x2.xy, vec2<f32>(-33.491294770, 13.762053843));
+
+    return saturate(vec3<f32>(r, g, b));
+}
+
+fn plasma_quintic(x_in: f32) -> vec3<f32> {
+    let x  = saturate(x_in);
+    let x1 = vec4<f32>(1.0, x, x * x, x * x * x);  // 1, x, x^2, x^3
+    let x2 = x1 * x1.w * x;                        // x^4, x^5, x^6, x^7
+
+    let r = dot(x1, vec4<f32>( 0.063861086,  1.992659096, -1.023901152, -0.490832805))
+          + dot(x2.xy, vec2<f32>( 1.308442123, -0.914547012));
+
+    let g = dot(x1, vec4<f32>( 0.049718590, -0.791144343,  2.892305078,  0.811726816))
+          + dot(x2.xy, vec2<f32>(-4.686502417,  2.717794514));
+
+    let b = dot(x1, vec4<f32>( 0.513275779,  1.580255060, -5.164414457,  4.559573646))
+          + dot(x2.xy, vec2<f32>(-1.916810682,  0.570638854));
+
+    return saturate(vec3<f32>(r, g, b));
+}
+
 @fragment
 fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @location(0) vec4f {
 
-	var rayPosition = vec3f(cube_pos * vec3f(cubeSize));
+	var rayOrigin = vec3f(cube_pos * vec3f(cubeSize));
+	var rayPosition = rayOrigin;
 	let rayDirection = normalize(world_pos - constants.eye_pos);
 
 	let delta = abs(1.0 / rayDirection);
 	let step = sign(rayDirection);
 
+	let f = fract(rayPosition);
 	var sideDistance = vec3f(
-		select(fract(rayPosition.x), floor(rayPosition.x + 1.0) - rayPosition.x, rayDirection.x >= 0) * delta.x,
-		select(fract(rayPosition.y), floor(rayPosition.y + 1.0) - rayPosition.y, rayDirection.y >= 0) * delta.y,
-		select(fract(rayPosition.z), floor(rayPosition.z + 1.0) - rayPosition.z, rayDirection.z >= 0) * delta.z,
+		select(f.x, 1.0 - f.x, rayDirection.x >= 0) * delta.x,
+		select(f.y, 1.0 - f.y, rayDirection.y >= 0) * delta.y,
+		select(f.z, 1.0 - f.z, rayDirection.z >= 0) * delta.z
 	);
+
+	let center = vec3f(cubeSize) / 2.0;
 
 	var voxel_state : u32;
 	if (usePackedValues) {
@@ -154,20 +264,40 @@ fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @loca
 			let shiftAmount = (u32(rayPosition.x) % packedValueCount) * packedValueSize;
 			voxel_state = (readBuffer[flatIndex] >> shiftAmount) & packedValueMask;
 
-			if (!(voxel_state <= 2)) {
-				break;
+			let isTransparent = voxel_state <= states / 2;
+
+			const renderAsSphere = false;
+
+			if (renderAsSphere) {
+				let isInCenter = distance(center, ceil(rayPosition)) < center.x;
+				if (!isInCenter) {
+					rayOrigin = rayPosition;
+				}
+
+				if (!isTransparent && isInCenter) {
+					break;
+				}
+			} else {
+				if (!isTransparent) {
+					break;
+				}
 			}
 
-			if (sideDistance.x < sideDistance.y && sideDistance.x < sideDistance.z) {
-				sideDistance.x += delta.x;
-				rayPosition.x += step.x;
-			} else if (sideDistance.y < sideDistance.z) {
-				sideDistance.y += delta.y;
-				rayPosition.y += step.y;
-			} else {
-				sideDistance.z += delta.z;
-				rayPosition.z += step.z;
-			}
+			let m = min(min(sideDistance.x, sideDistance.y), sideDistance.z);
+			let distanceIncrement = vec3f(
+				select(0.0, delta.x, m == sideDistance.x),
+				select(0.0, delta.y, m == sideDistance.y),
+				select(0.0, delta.z, m == sideDistance.z)
+			);
+			let positionIncrement = vec3f(
+				select(0.0, step.x, m == sideDistance.x),
+				select(0.0, step.y, m == sideDistance.y),
+				select(0.0, step.z, m == sideDistance.z),
+			);
+
+			sideDistance += distanceIncrement;
+			rayPosition += positionIncrement;
+
 			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
 				return vec4f(vec3f(0.0), 1.0);
 			}
@@ -198,11 +328,15 @@ fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @loca
 		}
 	}
 
-	// let c = hsl(f32(voxel_state) / f32(states) * 0.5 + 0.5, 0.65, 0.5);
-	// let c = vec3f(f32(voxel_state) / f32(states));
+	let distance = length(rayPosition - rayOrigin);
+	let fade = exp(-distance * (1.0 / 32.0));
+
+	// let c = hsl(f32(voxel_state) / f32(states) * 0.5 + 0.3, 0.65, 0.5);
+	// let c = vec3f(f32(voxel_state) / f32(states)) * fade;
 	// let c = normalize(world_pos - constants.eye_pos);
-	let c = roseSandPalette[voxel_state];
-	return vec4f(c, 1.0);
+	// let c = coralReef[voxel_state];
+	let c = magma_quintic(f32(voxel_state) / f32(states));
+	return vec4f(c * fade, 1.0);
 }
 
 
@@ -210,19 +344,17 @@ const usePackedValues = ${usePackedValues ? "true" : "false"};
 const vonNeumannNeighborhood = ${vonNeumannNeighborhood ? "true" : "false"};
 const states = ${states};
 const threshold = ${threshold};
-const range = 1;
-
-const workgroupSize = vec3i(${workgroupX}, ${workgroupY}, ${workgroupZ});
+const range = ${range};
 
 fn wrapCoord(n: i32) -> i32 {
-	if (n >= cubeSize) { return n - cubeSize; };
+	if (n >= (cubeSize)) { return n - cubeSize; };
 	if (n < 0) { return n + cubeSize; };
 	return n;
 }
 
 fn wrapCoordPacked(n: i32) -> i32 {
-	if (n >= (packedCubeSize)) { return n - (packedCubeSize); };
-	if (n < 0) { return n + (packedCubeSize); };
+	if (n >= (packedCubeSize)) { return n - packedCubeSize; };
+	if (n < 0) { return n + packedCubeSize; };
 	return n;
 }
 
@@ -230,10 +362,10 @@ fn wrapCoords(coords: vec3i) -> vec3i {
 	return vec3i(wrapCoord(coords.x), wrapCoord(coords.y), wrapCoord(coords.z));
 }
 
-fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
-	let idx = id.z * cubeSizeSq + id.y * cubeSize + id.x;
-	let current_state = readBuffer[idx];
-	let next_state = select(current_state + 1, 0, current_state + 1 == states);
+fn cca_basic(id: vec3<u32>) {
+	let idx = id.z*cubeSizeSq + id.y*cubeSize + id.x;
+	let currentState = readBuffer[idx];
+	let nextState = select(currentState + 1, 0, currentState + 1 == states);
 	var count = 0u;
 	if (vonNeumannNeighborhood) {
 		for (var z = -range; z <= range; z += 1) {
@@ -245,7 +377,7 @@ fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 				for (var x = -xSearch; x <= xSearch; x += 1) {
 					if (z == 0 && y == 0 && x == 0) { continue; }
 					let nx = wrapCoord(x + i32(id.x));
-					if (readBuffer[nz + ny + nx] == next_state) {
+					if (readBuffer[nz + ny + nx] == nextState) {
 						count += 1u;
 					}
 				}
@@ -259,21 +391,21 @@ fn cca_basic(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 				for (var x = -range; x <= range; x += 1) {
 					if (z == 0 && y == 0 && x == 0) { continue; }
 					let nx = wrapCoord(x + i32(id.x));
-					if (readBuffer[nz + ny + nx] == next_state) {
+					if (readBuffer[nz + ny + nx] == nextState) {
 						count += 1u;
 					}
 				}
 			}
 		}
 	}
-	writeBuffer[idx] = select(current_state, next_state, count >= threshold);
+	writeBuffer[idx] = select(currentState, nextState, count >= threshold);
 }
 
 fn flatten_index(index: vec3i, dimensions: vec3i) -> i32 {
 	return (index.z*(dimensions.x*dimensions.y)) + index.y*dimensions.x + index.x;
 }
 
-fn cca_packed(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
+fn cca_packed(id: vec3<u32>) {
 	let idx = id.z * (cubeSize * packedCubeSize) + id.y * packedCubeSize + id.x;
 	let packedStates = readBuffer[idx];
 
@@ -361,17 +493,73 @@ fn cca_packed(id: vec3<u32>, local_id: vec3<u32>, workgroup_id: vec3<u32>) {
 	writeBuffer[idx] = out;
 }
 
+/*
+fn cca_packed_alt(id: vec3<u32>) {
+	let idx = id.z*(cubeSize*packedCubeSize) + id.y*packedCubeSize + (id.x/packedValueCount);
+	let shiftAmount = (id.x % packedValueCount) * packedValueSize;
+
+	let packedStates = readBuffer[idx];
+	let currentState = (packedStates >> shiftAmount) & packedValueMask;
+	let nextState = select(currentState + 1u, 0, currentState + 1u == states);
+
+	var count = 0u;
+	if (vonNeumannNeighborhood) {
+		for (var z = -range; z <= range; z += 1) {
+			let nz = wrapCoord(z + i32(id.z)) * (packedCubeSize*cubeSize);
+			let ySearch = range - abs(z);
+			for (var y = -ySearch; y <= ySearch; y += 1) {
+				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+				let xSearch = range - abs(y) - abs(z);
+				for (var x = -xSearch; x <= xSearch; x += 1) {
+					if (z == 0 && y == 0 && x == 0) { continue; }
+					let nx = wrapCoord(x + i32(id.x));
+
+					let globalIndex = nz + ny + (nx / packedValueCount);
+					let bitIndex = u32((nx % packedValueCount) * packedValueSize);
+					let state = (readBuffer[globalIndex] >> bitIndex) & packedValueMask;
+					count += u32(state == nextState);
+				}
+			}
+		}
+	} else {
+		for (var z = -range; z <= range; z += 1) {
+			let nz = wrapCoord(z + i32(id.z)) * (packedCubeSize*cubeSize);
+			for (var y = -range; y <= range; y += 1) {
+				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+				for (var x = -range; x <= range; x += 1) {
+					if (z == 0 && y == 0 && x == 0) { continue; }
+					let nx = wrapCoord(x + i32(id.x));
+
+					let globalIndex = nz + ny + (nx / packedValueCount);
+					let bitIndex = u32((nx % packedValueCount) * packedValueSize);
+					let state = (readBuffer[globalIndex] >> bitIndex) & packedValueMask;
+					count += u32(state == nextState);
+				}
+			}
+		}
+	}
+
+	var outState = select(currentState, nextState, count >= threshold);
+	var outPackedStates = outState;
+
+	for (var i = 1u; i < packedValueCount; i += 1) {
+		let shiftedStates = subgroupShuffleDown(outState, i);
+		outPackedStates |= shiftedStates << (packedValueSize * i);
+	}
+
+	if (id.x % packedValueCount == 0) {
+		writeBuffer[idx] = outPackedStates;
+	}
+}
+*/
+
 @compute
 @workgroup_size(${workgroupX}, ${workgroupY}, ${workgroupZ})
-fn cs_main(
-	@builtin(global_invocation_id) id: vec3<u32>,
-	@builtin(local_invocation_id) local_id: vec3<u32>,
-	@builtin(workgroup_id) workgroup_id : vec3<u32>
-) {
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 	if (usePackedValues) {
-		cca_packed(id, local_id, workgroup_id);
+		cca_packed(id);
 	} else {
-		cca_basic(id, local_id, workgroup_id);
+		cca_basic(id);
 	}
 }
 `
@@ -473,6 +661,7 @@ const rand = (deterministicRandomness) ? mulberry32(12345) : Math.random;
 			let r = 0;
 			for (let j = 0; j < packedValueCount; ++j) {
 				r |= Math.floor(rand() * states) << (j * packedValueSize);
+				// r |= Math.floor(j % states) << (j * packedValueSize);
 			}
 			initialBufferData[i] = r;
 		}
@@ -535,37 +724,13 @@ const renderPipeline = device.createRenderPipeline({
 	fragment: {
 		entryPoint: "fs_main",
 		module: shaderModule,
-		targets: [
-			{
-				format,
-				/*
-				blend: {
-					color: {
-						srcFactor: 'src-alpha',
-						dstFactor: 'one-minus-src-alpha',
-						operation: 'add',
-					},
-					alpha: {
-						srcFactor: 'one',
-						dstFactor: 'one-minus-src-alpha',
-						operation: 'add',
-					},
-				},
-				writeMask: GPUColorWrite.ALL
-				*/
-			}
-		]
+		targets: [{ format }]
 	},
 	primitive: {
 		topology: "triangle-list",
 		frontFace: 'ccw',
 		cullMode: 'back'
 	},
-	depthStencil: {
-		format: "depth24plus",
-		depthWriteEnabled: false,
-		depthCompare: "less"
-	}
 });
 
 const computePipeline = device.createComputePipeline({
@@ -625,15 +790,12 @@ const queryBufferCPU = device.createBuffer({
 	usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
 });
 
-let depthTexture;
-let depthView;
-
 const start = document.timeline.currentTime;
 let lastTime = start;
 
 const frameSkip = 1;
 let frameIndex = -1;
-const useBenchmarks = false;
+const useBenchmarks = true;
 
 const samples = 128;
 const times = new Float64Array(samples);
@@ -663,16 +825,17 @@ async function writeResults(frameIndex) {
 		sorted_times.sort((a, b) => a - b); // ascending
 
 		const median = sorted_times[Math.floor(samples / 2)].toFixed(2);
-		const worst = sorted_times[samples - 1].toFixed(2);
-		const best = sorted_times[0].toFixed(2);
-		const inverse_length = 1.0 / samples;
-		const mean = sorted_times.reduce((a, b) => a + b) * inverse_length;
-		const variance = sorted_times.reduce((a, b) =>
-			a + (b - mean)**2
-		) * inverse_length;
+		const worst = sorted_times[samples - 1];
+		const best = sorted_times[0];
+		const mean = sorted_times.reduce((a, b) => a + b) / samples;
+		let variance = 0;
+		for (let i = 0; i < samples; ++i) {
+			variance += (sorted_times[i] - mean)**2;
+		}
+		variance /= samples;
 		const std_dev = Math.sqrt(variance);
 		// console.log(`Compute Pass: ${sorted_times[50].toFixed(2)}ms`);
-		console.log(`Compute Pass\nMedian: ${median}\nWorst: ${worst}\nBest:${best}\nMean: ${mean.toFixed(2)}\nStandard Deviation: ${std_dev.toFixed(2)}`);
+		console.log(`Compute Pass\nMedian: ${median}\nWorst: ${worst.toFixed(2)}\nBest:${best.toFixed(2)}\nMean: ${mean.toFixed(2)}\nStandard Deviation: ${std_dev.toFixed(2)}`);
 	}
 	// console.log(`Frame ${frameIndex} - Render Pass: ${renderPassDurationMS}ms - Compute Pass: ${computePassDurationMS}ms`);
 }
@@ -683,7 +846,7 @@ function degreesToRadians(degrees) {
 
 let runningSimulation = true;
 
-let angleX = degreesToRadians(30);
+let angleX = degreesToRadians(45);
 
 let moveLeft = false;
 let moveRight = false;
@@ -708,9 +871,20 @@ window.onkeydown = (e) => {
 	}
 }
 
+let recorder;
+
 async function frame(currentTime) {
 
 	frameIndex += 1;
+
+	if (startRecording) {
+		if (frameIndex == 3) {
+			recorder = setupRecorder();
+			recorder.start();
+		} else if (frameIndex == 3 + 60 * 9) {
+			recorder.stop();
+		}
+	}
 
 	const time = (currentTime - start) * (1.0 / 1024.0);
 	const dt = currentTime - lastTime;
@@ -724,7 +898,7 @@ async function frame(currentTime) {
 	}
 
 	{
-		const eye = vec3.create(Math.sin(angleX) * 1.5, 1.0, Math.cos(angleX) * 1.5);
+		const eye = vec3.create(Math.sin(angleX) * 1.0, 1.0, Math.cos(angleX) * 1.0);
 		const target = vec3.create(0, 0, 0);
 		const up = vec3.create(0, 1, 0);
 		const view = mat4.lookAt(eye, target, up);
@@ -750,12 +924,6 @@ async function frame(currentTime) {
 				storeOp: "store",
 				clearValue: { r: 0.0, g: 0, b: 0, a: 1 }
 			}],
-			depthStencilAttachment: {
-				view: depthView,
-				depthClearValue: 1.0,
-				depthLoadOp: "clear",
-				depthStoreOp: "store"
-			},
 			timestampWrites: {
 				querySet,
 				beginningOfPassWriteIndex: 0,
@@ -806,18 +974,43 @@ async function frame(currentTime) {
 requestAnimationFrame(frame);
 
 function resize() {
+	if (startRecording && (canvas.width != recordingResolution || canvas.height != recordingResolution)) {
+		canvas.width = canvas.height = recordingResolution;
+		return;
+	}
 	const w = window.innerWidth;
 	const h = window.innerHeight;
 	if (canvas.width != w || canvas.height != h) {
 		canvas.width = w;
 		canvas.height = h;
-		depthTexture = device.createTexture({
-			size: [canvas.width, canvas.height],
-			format: 'depth24plus',
-			usage: GPUTextureUsage.RENDER_ATTACHMENT
-		});
-		depthView = depthTexture.createView();
 	}
 }
 resize();
 window.onresize = resize;
+
+function setupRecorder() {
+	const fps = 20;
+	const stream = canvas.captureStream(fps);
+
+	const mimeType =
+	  MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' :
+	  MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' :
+	  'video/webm';
+
+	const recorder = new MediaRecorder(stream, {
+		mimeType,
+		videoBitsPerSecond: 64_000_000,
+	});
+
+	const chunks = [];
+	recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+	recorder.onstop = () => {
+		console.log("recorder stopped!");
+		const blob = new Blob(chunks, { type: mimeType });
+		const url = URL.createObjectURL(blob);
+		const a = Object.assign(document.createElement('a'), { href: url, download: 'capture.webm' });
+		a.click();
+		URL.revokeObjectURL(url);
+	};
+	return recorder;
+}
