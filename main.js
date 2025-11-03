@@ -21,11 +21,11 @@ context.configure({
 	alphaMode: "opaque"
 });
 
-const states = 7;
+const states = 8;
 const threshold = 15;
 const range = 2;
-const cubeSize = 256;
-const cubeSizeSq = cubeSize**2;
+const gridSize = 256;
+const gridSizeSq = gridSize**2;
 
 
 // N 8, t 15, r 2, size: 256, moore
@@ -41,15 +41,13 @@ const startRecording = false;
 const recordingResolution = 1024;
 
 function bitWidth(n) {
-	if (n == 0) {
-		return 1;
-	}
-	let width = 0;
-	while (n > 0) {
-		width += 1;
-		n = n >> 1;
-	}
-	return width;
+  let width = 1;
+  n = n >> 1;
+  while (n > 0) {
+    width += 1;
+    n = n >> 1;
+  }
+  return width;
 }
 function nextPowerOfTwo(n) {
 	if (n == 0) return 1;
@@ -63,10 +61,10 @@ function nextPowerOfTwo(n) {
 	return n;
 }
 
-const packedValueSize = nextPowerOfTwo(bitWidth(states));
-const packedValueCount = Math.floor(32 / packedValueSize);
-const packedValueMask = ((1 << packedValueSize) - 1) | 0;
-const packedCubeSize = Math.floor(cubeSize / packedValueCount);
+const packedValueSize = nextPowerOfTwo(bitWidth(states - 1));
+const packedValueCount = 32 / packedValueSize;
+const packedValueMask = (1 << packedValueSize) - 1;
+const gridSizeXDimension = gridSize / packedValueCount;
 
 function downloadCanvasPNG(namePrefix = "canvas") {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -135,13 +133,13 @@ fn hsl(h: f32, s: f32, l: f32) -> vec3f {
     return rgb + vec3f(m);
 }
 
-const cubeSize = ${cubeSize};
-const cubeSizeSq = ${cubeSizeSq};
+const gridSize = ${gridSize};
+const gridSizeSq = ${gridSizeSq};
 
 const packedValueSize = ${packedValueSize};
 const packedValueCount = ${packedValueCount};
 const packedValueMask = ${packedValueMask};
-const packedCubeSize = ${packedCubeSize};
+const gridSizeXDimension = ${gridSizeXDimension};
 
 const roseSandPalette = array<vec3<f32>, 10>(
     vec3<f32>(0.298, 0.000, 0.059), // deep wine rose
@@ -238,12 +236,40 @@ fn plasma_quintic(x_in: f32) -> vec3<f32> {
     return saturate(vec3<f32>(r, g, b));
 }
 
+
 @fragment
 fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @location(0) vec4f {
 
-	var rayOrigin = vec3f(cube_pos * vec3f(cubeSize));
-	var rayPosition = rayOrigin;
+	const drawOutline = false;
+	if (drawOutline) {
+		let edge = abs(cube_pos - 0.5) > vec3f(0.5 - (1.0 / 164.0));
+		if (all(edge.xy) || all(edge.xz) || all(edge.yz)) {
+				return vec4f(vec3f(0.0, 1.0, 0.0), 1.0);
+		}
+	}
+
+	var rayOrigin = vec3f(cube_pos * vec3f(gridSize));
+
 	let rayDirection = normalize(world_pos - constants.eye_pos);
+	// let rayDirection = normalize(world_pos - vec3f(sin(0.7854) * 1.5, sin(0.7854) * 1.5, cos(0.7854) * 1.5));
+	const center = vec3f(gridSize) / 2.0;
+
+	const renderAsSphere = false;
+	if (renderAsSphere) {
+		let sphereCenter = center - rayOrigin;
+		let t = dot(sphereCenter, rayDirection);
+		let projectedPoint = rayDirection * t;
+
+		const radius = center.x;
+		let distanceFromCenter = length(sphereCenter - projectedPoint);
+
+		if (distanceFromCenter > radius+1.0) {
+			return vec4f(vec3f(0.0, 0.0, 0.0), 1.0);
+		}
+
+	}
+
+	var rayPosition = rayOrigin;
 
 	let delta = abs(1.0 / rayDirection);
 	let step = sign(rayDirection);
@@ -255,87 +281,55 @@ fn fs_main(@location(0) cube_pos: vec3f, @location(1) world_pos: vec3f) -> @loca
 		select(f.z, 1.0 - f.z, rayDirection.z >= 0) * delta.z
 	);
 
-	let center = vec3f(cubeSize) / 2.0;
-
 	var voxel_state : u32;
-	if (usePackedValues) {
-		loop {
-			let flatIndex = u32(rayPosition.z)*(packedCubeSize*cubeSize) + u32(rayPosition.y)*(packedCubeSize) + (u32(rayPosition.x) / packedValueCount);
+	loop {
+		if (usePackedValues) {
+			let flatIndex = u32(rayPosition.z)*(gridSizeXDimension*gridSize) + u32(rayPosition.y)*(gridSizeXDimension) + (u32(rayPosition.x) / packedValueCount);
 			let shiftAmount = (u32(rayPosition.x) % packedValueCount) * packedValueSize;
 			voxel_state = (readBuffer[flatIndex] >> shiftAmount) & packedValueMask;
-
-			let isTransparent = voxel_state <= states / 2;
-
-			const renderAsSphere = false;
-
-			if (renderAsSphere) {
-				let isInCenter = distance(center, ceil(rayPosition)) < center.x;
-				if (!isInCenter) {
-					rayOrigin = rayPosition;
-				}
-
-				if (!isTransparent && isInCenter) {
-					break;
-				}
-			} else {
-				if (!isTransparent) {
-					break;
-				}
-			}
-
-			let m = min(min(sideDistance.x, sideDistance.y), sideDistance.z);
-			let distanceIncrement = vec3f(
-				select(0.0, delta.x, m == sideDistance.x),
-				select(0.0, delta.y, m == sideDistance.y),
-				select(0.0, delta.z, m == sideDistance.z)
-			);
-			let positionIncrement = vec3f(
-				select(0.0, step.x, m == sideDistance.x),
-				select(0.0, step.y, m == sideDistance.y),
-				select(0.0, step.z, m == sideDistance.z),
-			);
-
-			sideDistance += distanceIncrement;
-			rayPosition += positionIncrement;
-
-			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
-				return vec4f(vec3f(0.0), 1.0);
-			}
+		} else {
+			let flatIndex = u32(rayPosition.z)*gridSizeSq + u32(rayPosition.y)*gridSize + u32(rayPosition.x);
+			voxel_state = readBuffer[flatIndex];
 		}
 
-	} else {
-		loop {
-			let flatIndex = u32(rayPosition.z)*cubeSizeSq + u32(rayPosition.y)*cubeSize + u32(rayPosition.x);
-			voxel_state = readBuffer[flatIndex];
+		var isTransparent = voxel_state <= 5;
+		if (renderAsSphere) {
+			let isInCenter = distance(center, ceil(rayPosition)) < center.x;
+			if (!isInCenter) {
+				isTransparent = true;
+				rayOrigin = rayPosition;
+			}
+		}
+		if (!isTransparent) {
+			break;
+		}
 
-			if (!(voxel_state >= 0 && voxel_state <= 2)) {
-				break;
-			}
+		let m = min(min(sideDistance.x, sideDistance.y), sideDistance.z);
+		if (m == sideDistance.x) {
+			sideDistance.x += delta.x;
+			rayPosition.x += step.x;
+		} else if (m == sideDistance.y) {
+			sideDistance.y += delta.y;
+			rayPosition.y += step.y;
+		} else {
+			sideDistance.z += delta.z;
+			rayPosition.z += step.z;
+		}
 
-			if (sideDistance.x < sideDistance.y && sideDistance.x < sideDistance.z) {
-				sideDistance.x += delta.x;
-				rayPosition.x += step.x;
-			} else if (sideDistance.y < sideDistance.x && sideDistance.y < sideDistance.z) {
-				sideDistance.y += delta.y;
-				rayPosition.y += step.y;
-			} else {
-				sideDistance.z += delta.z;
-				rayPosition.z += step.z;
-			}
-			if (any(rayPosition >= vec3f(cubeSize)) || any(rayPosition < vec3f(0.0))) {
-				return vec4f(vec3f(0.0), 1.0);
-			}
+		if (any(rayPosition >= vec3f(gridSize)) || any(rayPosition < vec3f(0.0))) {
+			return vec4f(vec3f(0.0), 1.0);
 		}
 	}
 
 	let distance = length(rayPosition - rayOrigin);
-	let fade = exp(-distance * (1.0 / 32.0));
+	// let fade = exp(-distance * (1.0 / 32.0));
+	let fade = exp(-distance * (1.0 / 64.0));
 
 	// let c = hsl(f32(voxel_state) / f32(states) * 0.5 + 0.3, 0.65, 0.5);
 	// let c = vec3f(f32(voxel_state) / f32(states)) * fade;
 	// let c = normalize(world_pos - constants.eye_pos);
-	// let c = coralReef[voxel_state];
-	let c = magma_quintic(f32(voxel_state) / f32(states));
+	let c = coralReef[voxel_state];
+	// let c = magma_quintic(f32(voxel_state) / f32(states));
 	return vec4f(c * fade, 1.0);
 }
 
@@ -347,14 +341,14 @@ const threshold = ${threshold};
 const range = ${range};
 
 fn wrapCoord(n: i32) -> i32 {
-	if (n >= (cubeSize)) { return n - cubeSize; };
-	if (n < 0) { return n + cubeSize; };
+	if (n >= (gridSize)) { return n - gridSize; };
+	if (n < 0) { return n + gridSize; };
 	return n;
 }
 
 fn wrapCoordPacked(n: i32) -> i32 {
-	if (n >= (packedCubeSize)) { return n - packedCubeSize; };
-	if (n < 0) { return n + packedCubeSize; };
+	if (n >= (gridSizeXDimension)) { return n - gridSizeXDimension; };
+	if (n < 0) { return n + gridSizeXDimension; };
 	return n;
 }
 
@@ -363,16 +357,16 @@ fn wrapCoords(coords: vec3i) -> vec3i {
 }
 
 fn cca_basic(id: vec3<u32>) {
-	let idx = id.z*cubeSizeSq + id.y*cubeSize + id.x;
+	let idx = id.z*gridSizeSq + id.y*gridSize + id.x;
 	let currentState = readBuffer[idx];
 	let nextState = select(currentState + 1, 0, currentState + 1 == states);
 	var count = 0u;
 	if (vonNeumannNeighborhood) {
 		for (var z = -range; z <= range; z += 1) {
-			let nz = wrapCoord(z + i32(id.z)) * cubeSizeSq;
+			let nz = wrapCoord(z + i32(id.z)) * gridSizeSq;
 			let ySearch = range - abs(z);
 			for (var y = -ySearch; y <= ySearch; y += 1) {
-				let ny = wrapCoord(y + i32(id.y)) * cubeSize;
+				let ny = wrapCoord(y + i32(id.y)) * gridSize;
 				let xSearch = range - abs(y) - abs(z);
 				for (var x = -xSearch; x <= xSearch; x += 1) {
 					if (z == 0 && y == 0 && x == 0) { continue; }
@@ -385,9 +379,9 @@ fn cca_basic(id: vec3<u32>) {
 		}
 	} else {
 		for (var z = -range; z <= range; z += 1) {
-			let nz = wrapCoord(z + i32(id.z)) * cubeSizeSq;
+			let nz = wrapCoord(z + i32(id.z)) * gridSizeSq;
 			for (var y = -range; y <= range; y += 1) {
-				let ny = wrapCoord(y + i32(id.y)) * cubeSize;
+				let ny = wrapCoord(y + i32(id.y)) * gridSize;
 				for (var x = -range; x <= range; x += 1) {
 					if (z == 0 && y == 0 && x == 0) { continue; }
 					let nx = wrapCoord(x + i32(id.x));
@@ -406,7 +400,7 @@ fn flatten_index(index: vec3i, dimensions: vec3i) -> i32 {
 }
 
 fn cca_packed(id: vec3<u32>) {
-	let idx = id.z * (cubeSize * packedCubeSize) + id.y * packedCubeSize + id.x;
+	let idx = id.z * (gridSize * gridSizeXDimension) + id.y * gridSizeXDimension + id.x;
 	let packedStates = readBuffer[idx];
 
 	var currentStates = array<u32, packedValueCount>();
@@ -423,20 +417,20 @@ fn cca_packed(id: vec3<u32>) {
 
 	if (vonNeumannNeighborhood) {
 		for (var z = -range; z <= range; z += 1) {
-			let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
+			let nz = wrapCoord(z + i32(id.z)) * (gridSize * gridSizeXDimension);
 			let yRange = range - abs(z);
 			for (var y = -yRange; y <= yRange; y += 1) {
-				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+				let ny = wrapCoord(y + i32(id.y)) * gridSizeXDimension;
 
 				const maxLength = 1 + ((range + (packedValueCount - 1)) / packedValueCount) * 2;
 				var adjacentStates = array<u32, maxLength>();
 				let xRange = range - abs(y) - abs(z);
-				let baseX = i32(id.x) - ((xRange + packedValueCount - 1) / packedValueCount);
+				let leftmostX = i32(id.x) - ((xRange + packedValueCount - 1) / packedValueCount);
 				let len = 1 + ((xRange + (packedValueCount - 1)) / packedValueCount) * 2;
 				let offset = (packedValueCount - (xRange % packedValueCount)) % packedValueCount;
 
 				for (var i = 0; i < len; i += 1) {
-					adjacentStates[i] = readBuffer[nz + ny + wrapCoordPacked(baseX + i)];
+					adjacentStates[i] = readBuffer[nz + ny + wrapCoordPacked(leftmostX + i)];
 				}
 
 				for (var i = 0u; i < packedValueCount; i += 1) {
@@ -455,16 +449,16 @@ fn cca_packed(id: vec3<u32>) {
 			}
 		}
 	} else {
-		let baseX = i32(id.x) - ((range + packedValueCount - 1) / packedValueCount);
+		let leftmostX = i32(id.x) - ((range + packedValueCount - 1) / packedValueCount);
 		for (var z = -range; z <= range; z += 1) {
-			let nz = wrapCoord(z + i32(id.z)) * (cubeSize * packedCubeSize);
+			let nz = wrapCoord(z + i32(id.z)) * (gridSize * gridSizeXDimension);
 			for (var y = -range; y <= range; y += 1) {
-				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
+				let ny = wrapCoord(y + i32(id.y)) * gridSizeXDimension;
 
 				const len = 1 + ((range + (packedValueCount - 1)) / packedValueCount) * 2;
-				var adjacentStates = array<u32, len>();
+				var packedWords = array<u32, len>();
 				for (var i = 0; i < len; i += 1) {
-					adjacentStates[i] = readBuffer[nz + ny + wrapCoordPacked(baseX + i)];
+					packedWords[i] = readBuffer[nz + ny + wrapCoordPacked(leftmostX + i)];
 				}
 
 				for (var i = 0u; i < packedValueCount; i += 1) {
@@ -474,7 +468,7 @@ fn cca_packed(id: vec3<u32>) {
 					for (var x = 0u; x <= range * 2; x += 1) {
 						const offset = (packedValueCount - (range % packedValueCount)) % packedValueCount;
 						let localX = x + i + offset;
-						let states = adjacentStates[localX / packedValueCount];
+						let states = packedWords[localX / packedValueCount];
 						let shiftAmount = (localX % packedValueCount) * packedValueSize;
 						let state = u32(states >> shiftAmount) & packedValueMask;
 						c += u32(state == nextState);
@@ -492,66 +486,6 @@ fn cca_packed(id: vec3<u32>) {
 	}
 	writeBuffer[idx] = out;
 }
-
-/*
-fn cca_packed_alt(id: vec3<u32>) {
-	let idx = id.z*(cubeSize*packedCubeSize) + id.y*packedCubeSize + (id.x/packedValueCount);
-	let shiftAmount = (id.x % packedValueCount) * packedValueSize;
-
-	let packedStates = readBuffer[idx];
-	let currentState = (packedStates >> shiftAmount) & packedValueMask;
-	let nextState = select(currentState + 1u, 0, currentState + 1u == states);
-
-	var count = 0u;
-	if (vonNeumannNeighborhood) {
-		for (var z = -range; z <= range; z += 1) {
-			let nz = wrapCoord(z + i32(id.z)) * (packedCubeSize*cubeSize);
-			let ySearch = range - abs(z);
-			for (var y = -ySearch; y <= ySearch; y += 1) {
-				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
-				let xSearch = range - abs(y) - abs(z);
-				for (var x = -xSearch; x <= xSearch; x += 1) {
-					if (z == 0 && y == 0 && x == 0) { continue; }
-					let nx = wrapCoord(x + i32(id.x));
-
-					let globalIndex = nz + ny + (nx / packedValueCount);
-					let bitIndex = u32((nx % packedValueCount) * packedValueSize);
-					let state = (readBuffer[globalIndex] >> bitIndex) & packedValueMask;
-					count += u32(state == nextState);
-				}
-			}
-		}
-	} else {
-		for (var z = -range; z <= range; z += 1) {
-			let nz = wrapCoord(z + i32(id.z)) * (packedCubeSize*cubeSize);
-			for (var y = -range; y <= range; y += 1) {
-				let ny = wrapCoord(y + i32(id.y)) * packedCubeSize;
-				for (var x = -range; x <= range; x += 1) {
-					if (z == 0 && y == 0 && x == 0) { continue; }
-					let nx = wrapCoord(x + i32(id.x));
-
-					let globalIndex = nz + ny + (nx / packedValueCount);
-					let bitIndex = u32((nx % packedValueCount) * packedValueSize);
-					let state = (readBuffer[globalIndex] >> bitIndex) & packedValueMask;
-					count += u32(state == nextState);
-				}
-			}
-		}
-	}
-
-	var outState = select(currentState, nextState, count >= threshold);
-	var outPackedStates = outState;
-
-	for (var i = 1u; i < packedValueCount; i += 1) {
-		let shiftedStates = subgroupShuffleDown(outState, i);
-		outPackedStates |= shiftedStates << (packedValueSize * i);
-	}
-
-	if (id.x % packedValueCount == 0) {
-		writeBuffer[idx] = outPackedStates;
-	}
-}
-*/
 
 @compute
 @workgroup_size(${workgroupX}, ${workgroupY}, ${workgroupZ})
@@ -627,7 +561,7 @@ const uniformBuffer = device.createBuffer({
 	usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
 
-const bufferSize = cubeSize**2 * (usePackedValues ? packedCubeSize : cubeSize) * 4;
+const bufferSize = gridSize**2 * (usePackedValues ? gridSizeXDimension : gridSize) * 4;
 const buffers = [
 	device.createBuffer({
 		mappedAtCreation: true,
@@ -666,7 +600,7 @@ const rand = (deterministicRandomness) ? mulberry32(12345) : Math.random;
 			initialBufferData[i] = r;
 		}
 	} else {
-		for (let i = 0; i < cubeSize**3; ++i) {
+		for (let i = 0; i < gridSize**3; ++i) {
 			initialBufferData[i] = rand() * states;
 		}
 	}
@@ -793,7 +727,7 @@ const queryBufferCPU = device.createBuffer({
 const start = document.timeline.currentTime;
 let lastTime = start;
 
-const frameSkip = 1;
+const frameSkip = 3;
 let frameIndex = -1;
 const useBenchmarks = true;
 
@@ -898,8 +832,8 @@ async function frame(currentTime) {
 	}
 
 	{
-		const eye = vec3.create(Math.sin(angleX) * 1.0, 1.0, Math.cos(angleX) * 1.0);
-		const target = vec3.create(0, 0, 0);
+		const eye = vec3.create(Math.sin(angleX) * 1.5, Math.sin(degreesToRadians(40)) * 1.5, Math.cos(angleX) * 1.5);
+		const target = vec3.create(0, -0.1, 0);
 		const up = vec3.create(0, 1, 0);
 		const view = mat4.lookAt(eye, target, up);
 		const fovy = 60 * (Math.PI / 180);
@@ -949,9 +883,9 @@ async function frame(currentTime) {
 		pass.setBindGroup(0, renderUniformBindGroup);
 		pass.setBindGroup(1, computeBindGroups[bindGroupIndex]);
 		if (usePackedValues) {
-			pass.dispatchWorkgroups(cubeSize / workgroupX / packedValueCount, cubeSize / workgroupY, cubeSize / workgroupZ);
+			pass.dispatchWorkgroups(gridSizeXDimension / workgroupX, gridSize / workgroupY, gridSize / workgroupZ);
 		} else {
-			pass.dispatchWorkgroups(cubeSize / workgroupX, cubeSize / workgroupY, cubeSize / workgroupZ);
+			pass.dispatchWorkgroups(gridSize / workgroupX, gridSize / workgroupY, gridSize / workgroupZ);
 		}
 		pass.end();
 		bindGroupIndex ^= 1;
